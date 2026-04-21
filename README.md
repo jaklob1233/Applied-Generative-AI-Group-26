@@ -26,16 +26,20 @@ crs_project/
 
 ## Setup
 
-### 1. Install dependencies
-```bash
-pip install -r requirements.txt
-```
+# 1. Create and activate a virtual environment
+python -m venv .venv
 
-### 2. Configure API keys
-```bash
-cp .env.example .env
-# Edit .env and add your keys
-```
+# On macOS/Linux:
+source .venv/bin/activate
+
+# On Windows:
+.venv\Scripts\activate
+
+# 2. Install dependencies (now inside the venv)
+pip install -r requirements.txt
+
+# 3. Configure API keys
+cp .env.example .env        # then edit .env and add your keys
 
 Get your keys:
 - **OpenAI**: https://platform.openai.com/api-keys
