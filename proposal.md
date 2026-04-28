@@ -512,112 +512,224 @@ Expression	Attribute	Grounding Rule
 "great camera", "good for photos"	Semantic retrieval signal	Camera-related similarity boost
 
 Key design principle: Grounding rules are computed dynamically from the actual product distribution at runtime. They are not hardcoded thresholds. If the product database changes, grounding adapts automatically.
-5.4 Semantic Retrieval Process
 
-At recommendation time, the following process runs in parallel with structured filtering:
 
-text
+## 5.4 Semantic Retrieval Process
 
-Step 1: QUERY CONSTRUCTION
-        Concatenate all user-stated needs from current session:
-        "Android phone with good camera and long battery life 
-         under €600, lightweight"
+At recommendation time, semantic retrieval operates alongside structured filtering. Instead of acting as a hard constraint, it contributes as a **soft ranking signal** across all valid candidates.
 
-Step 2: QUERY EMBEDDING
-        Embed the constructed query using 
-        text-embedding-3-small → 1536-dim vector
+---
 
-Step 3: SIMILARITY SEARCH
-        Query ChromaDB collection for the active category
-        Retrieve top-20 most similar products by cosine similarity
-        Return: [(product_id, similarity_score), ...]
+### Step 1: Query Construction
 
-Step 4: CANDIDATE INTERSECTION
-        Structured filtered candidates ∩ Semantic candidates
-        = Hybrid candidate set
-        
-        If intersection is empty:
-        → Fall back to structured filtered candidates only
-        → Log that semantic signal was not used this turn
+All user-stated preferences from the current session are concatenated into a single query string.
 
-Step 5: SCORE FUSION
-        For each product in hybrid candidate set:
-        
-        hybrid_score = α × structured_score + (1-α) × semantic_score
-        
-        Where:
-        α = 0.6 (structured filtering weighted higher by default)
-        1-α = 0.4 (semantic similarity contributes significantly)
-        
-        α is adjusted dynamically:
-        - If user has used many fuzzy expressions → α decreases (more semantic weight)
-        - If user has given precise numeric constraints → α increases (more structured weight)
+**Example:**
 
-Step 6: FINAL RANKING
-        Sort by hybrid_score descending
-        Return top-3 products
+"Android phone with good camera and long battery life under €600, lightweight"
+
+
+This step ensures both explicit constraints and implicit intent are captured in a unified representation.
+
+---
+
+### Step 2: Query Embedding
+
+The constructed query is converted into a dense vector using:
+
+
+text-embedding-3-small → 1536-dimensional vector
+
+
+This embedding captures semantic meaning such as:
+- "good camera" → photography-related features  
+- "long battery life" → battery capacity / efficiency  
+- "lightweight" → device weight preference  
+
+---
+
+### Step 3: Semantic Similarity Search
+
+The query embedding is used to search the vector database (ChromaDB) within the active category.
+
+- Retrieve **top-N (e.g., 20)** most similar products  
+- Similarity metric: **cosine similarity**
+
+**Output:**
+
+[(product_id, similarity_score), ...]
+
+
+Scores are normalized to the range **[0, 1]** for compatibility with structured scores.
+
+---
+
+### Step 4: Hybrid Re-ranking
+
+Semantic similarity is applied as a **re-ranking signal** over all structured candidates.
+
+For each product in `filtered_candidates`:
+
+
+if product_id in semantic_candidates:
+semantic_score = normalized cosine similarity (0–1)
+else:
+semantic_score = 0.0
+
+
+Compute the final score:
+
+
+hybrid_score = α × structured_score + (1 - α) × semantic_score
+
+
+#### Dynamic Weighting (α)
+
+- Default: **α = 0.6** (structured filtering prioritized)
+- Adjustments:
+  - More vague / fuzzy queries → decrease α (increase semantic influence)
+  - More precise numeric constraints → increase α (increase structured influence)
+
+**Key Advantage:**
+- Prevents loss of semantic signal when filters are strict  
+- Ensures all valid candidates can benefit from semantic ranking  
+
+---
+
+### Step 5: Exclusion Handling
+
+Remove previously shown or explicitly rejected products:
+
+
+candidate_set = candidate_set
+- shown_products
+- rejected_products
+
+
+If remaining candidates are fewer than requested:
+- Return all available products  
+- Log that results were truncated  
+
+---
+
+### Step 6: Final Ranking and Selection
+
+- Sort candidates by `hybrid_score` (descending)  
+- Return **top-K products** (e.g., top-3)
+
+Each result includes:
+- `hybrid_score`  
+- `structured_score`  
+- `semantic_score`  
+
+---
+
+### Summary
+
+This approach replaces intersection-based filtering with full-set re-ranking:
+
+- Semantic similarity always contributes when available  
+- No candidates are lost due to strict filtering  
+- More robust handling of edge cases  
+- Better alignment with real-world recommendation systems  
 
 5.5 Dynamic Weight Adjustment
 
-The α parameter (and internal scoring weights) are adjusted based on signals from the conversation:
-Signal	Adjustment
-User says "cheaper" in REFINE turn	Increase value_score weight
-User says "better camera" in REFINE turn	Increase camera_score weight (smartphones)
-User says "lighter" in REFINE turn	Increase portability_score weight (laptops)
-User says "quieter" in REFINE turn	Increase noise_score weight (washing machines)
-User uses many fuzzy expressions	Decrease α (increase semantic weight)
-User gives precise numeric constraints	Increase α (increase structured weight)
+The α parameter (structured vs. semantic weighting) and internal scoring weights are adjusted deterministically based on conversation signals. All adjustments are bounded to prevent instability.
+
+α Adjustment Formula:
+α_base = 0.6
+fuzzy_count = len(state.fuzzy_expressions)
+numeric_count = count of explicitly numeric constraints in state.hard_constraints + state.soft_constraints
+α = clip(α_base - 0.08 × fuzzy_count + 0.06 × numeric_count, 0.3, 0.8)
+
+Where clip(value, min, max) enforces bounds. α is recalculated at each RECOMMEND_ITEMS or REFINE_RESULTS turn.
+
+Scoring Weight Adjustments (applied to preference_weights in DialogueState):
+Signal	Adjustment	Bound
+User says "cheaper" / "better value" in REFINE	value_score += 0.10	max 0.50
+User says "better camera" in REFINE (smartphones)	camera_score += 0.10	max 0.45
+User says "lighter" / "more portable" in REFINE (laptops)	portability_score += 0.10	max 0.40
+User says "quieter" in REFINE (washing machines)	noise_score += 0.10	max 0.45
+Category switch	Reset all weights to defaults	—
+
+All weight updates are logged in LangSmith. Weights are normalised to sum to 1.0 after each adjustment.
+
 
 These adjustments are stored in the preference_weights field of the DialogueState and applied in subsequent recommendation calls.
-6. Dialogue System Design
-6.1 Dialogue State
-6.1.1 Complete State Definition
 
-Session Metadata
+## 6. Dialogue System Design
 
-    session_id — unique session identifier (UUID)
-    turn_count — number of completed turns
-    created_at — session creation timestamp
+## 6.1 Dialogue State
 
-Intent Tracking
+## 6.1.1 Complete State Definition
 
-    current_intent — intent of the most recent user utterance
-    intent_history — list of (turn_number, intent) pairs for all turns
-    intent_confidence — confidence score returned by Intent Classifier for current turn
+### Session Metadata
 
-Category
+- `session_id` — unique session identifier (UUID)  
+- `turn_count` — number of completed turns  
+- `created_at` — session creation timestamp  
 
-    category — active product category (smartphone / laptop / washing_machine / None)
-    category_confirmed — boolean; True after category has been confirmed with user
+---
 
-Preferences
+### Intent Tracking
 
-    preferences — category-specific structured preference object (see 6.1.2)
-    preference_weights — dynamic scoring weights for current session (dict, float values 0–1)
-    fuzzy_expressions — list of fuzzy expressions used this session (for α adjustment)
+- `current_intent` — intent of the most recent user utterance  
+- `intent_history` — list of `(turn_number, intent)` pairs for all turns  
+- `intent_confidence` — confidence score returned by the Intent Classifier for the current turn  
 
-Constraints
+---
 
-    hard_constraints — list of Constraint objects that must always be satisfied
-    soft_constraints — list of Constraint objects that can be relaxed
+### Category
 
-Semantic State
+- `category` — active product category (`smartphone` / `laptop` / `washing_machine` / `None`)  
+- `category_confirmed` — boolean; `True` after category has been explicitly confirmed with the user  
 
-    semantic_query — current aggregated natural language representation of user needs
-    last_semantic_scores — dict of product_id → semantic similarity score from last retrieval
+---
 
-Conversation Management
+### Preferences
 
-    asked_attributes — list of attribute names already asked about
-    shown_products — list of product IDs shown to user
-    rejected_products — list of product IDs explicitly dismissed by user
-    last_action — action selected in previous turn
-    last_recommendations — product IDs shown in most recent recommendation
-    relaxed_constraints — list of constraints that were relaxed in this session
+- `preferences` — category-specific structured preference object (see Section 6.1.2)  
+- `preference_weights` — dynamic scoring weights for the current session (`dict[str, float]`, values in `[0,1]`)  
+- `fuzzy_expressions` — list of fuzzy expressions used in this session (used for dynamic α adjustment in ranking)  
 
-History
+---
 
-    history — list of turn objects: {turn_number, role, message, timestamp}
+### Constraints
+
+- `hard_constraints` — list of Constraint objects that must always be satisfied  
+- `soft_constraints` — list of Constraint objects that can be relaxed if needed  
+
+- `hard_constraint_rejection_count` — integer; tracks consecutive zero-result responses after applying hard constraints  
+  - Incremented when no candidates are found under current hard constraints  
+  - Reset when:
+    - A valid recommendation is produced, or  
+    - The user switches category  
+  - Used to trigger controlled constraint relaxation strategies  
+
+---
+
+### Semantic State
+
+- `semantic_query` — current natural language representation of user needs (constructed from DialogueState)  
+- `last_semantic_scores` — dictionary mapping `product_id → semantic similarity score` from the most recent retrieval step  
+
+---
+
+### Conversation Management
+
+- `asked_attributes` — list of attribute names already queried from the user  
+- `shown_products` — list of product IDs already presented to the user  
+- `rejected_products` — list of product IDs explicitly dismissed by the user  
+- `last_action` — action selected in the previous turn  
+- `last_recommendations` — product IDs returned in the most recent recommendation step  
+- `relaxed_constraints` — list of constraints that have been relaxed during the session  
+
+---
+
+### History
+
+- `history` — list of turn objects:
 
 6.1.2 Category-Specific Preference Objects
 
@@ -662,6 +774,8 @@ max_noise_db	int or None
 loading_type	enum or None	front / top
 min_spin_rpm	int or None	
 steam_required	bool or None	
+
+
 6.1.3 Constraint Object Structure
 
 Each constraint is stored as a structured object:
@@ -673,34 +787,157 @@ constraint_type	enum	HARD / SOFT	"HARD"
 confidence	float	Extraction confidence (0–1)	0.95
 source_turn	int	Which turn produced this constraint	2
 fuzzy_origin	string or None	Original fuzzy expression if grounded	"cheap"
+
 6.2 Intent Classification
+
 6.2.1 Intent Taxonomy
 Intent	Code	Description	Example Utterances
-Search	SEARCH	User wants a specific named product	"I want the iPhone 15 Pro", "Show me the Galaxy S24 Ultra"
-Explore	EXPLORE	User wants help finding a product	"Help me find a good Android phone", "I need a quiet washing machine"
-Refine	REFINE	User critiques or adjusts existing results	"Show me something cheaper", "Better battery please", "Not Samsung"
-Chitchat	CHITCHAT	Small talk, greetings, off-topic questions	"Thanks!", "What do you think of iPhone?", "Hello"
+Search	SEARCH	User wants a specific named product	"I want the iPhone 15 Pro"
+Explore	EXPLORE	User wants help finding a product	"Help me find a quiet washing machine"
+Refine	REFINE	User critiques or adjusts existing results	"Show me something cheaper"
+Summarize	SUMMARIZE	User asks what the system knows so far	"What have I told you?", "Summarise my preferences"
+Chitchat	CHITCHAT	Small talk, greetings, off-topic	"Thanks!", "Hello"
 Unknown	UNKNOWN	Cannot be mapped to supported intent	Gibberish, completely off-topic
-6.2.2 Intent Classifier Node
 
-The Intent Classifier is a dedicated LangGraph node that:
+## 6.2.2 Intent Classifier Node
 
-    Receives the user message and last 2 turns of history
-    Invokes GPT-4o-mini with a structured classification prompt
-    Returns a validated IntentResult (intent + confidence)
-    Is entirely separate from action selection (which is handled by the Policy Module)
+The **Intent Classifier** is a dedicated LangGraph node responsible solely for identifying the user’s intent at each turn. It is strictly decoupled from downstream decision-making, which is handled by the Policy Module.
 
-The prompt includes:
+---
 
-    Precise definition of all five intents
-    Three labelled examples per intent (15 examples total)
-    Instruction to return structured JSON: {intent, confidence, rationale}
-    Instruction that rationale is for debugging only and is not used in decisions
+### Responsibilities
 
-Retry and fallback:
+The node:
 
-    If parsing fails after 3 attempts: return UNKNOWN with confidence 0.0
-    If confidence < 0.4: return intent but flag for Policy Module to consider fallback behaviour
+- Receives:
+  - Current user message  
+  - Last **2 turns** of conversation history  
+
+- Invokes **GPT-4o-mini** with a structured classification prompt  
+
+- Returns a validated `IntentResult` object:
+
+{intent, confidence}
+
+
+- Does **not** perform any action selection  
+
+---
+
+### Prompt Design
+
+The classification prompt includes:
+
+- Precise definitions of all **five supported intents**  
+- **Three labeled examples per intent** (15 examples total)  
+- Clear instruction to return structured JSON:
+
+{intent, confidence, rationale}
+
+
+- Constraint:
+- `rationale` is included **for debugging only**  
+- It is **never used** in downstream decision logic  
+
+---
+
+### Output Schema
+
+- `intent` — predicted intent label  
+- `confidence` — float in range `[0, 1]`  
+- `rationale` — optional explanation (ignored by system logic)  
+
+---
+
+### Retry and Fallback Logic
+
+- If JSON parsing fails:
+- Retry up to **3 times**  
+
+- If parsing still fails after 3 attempts:
+
+intent = UNKNOWN
+confidence = 0.0
+
+
+- If classification confidence is low:
+- Threshold: `confidence < 0.4`  
+- Return predicted intent  
+- Flag for Policy Module to apply fallback or clarification strategies  
+
+---
+
+### Design Rationale
+
+This modular design ensures:
+
+- Clear separation between **intent understanding** and **decision policy**  
+- High robustness via structured prompting and retry handling  
+- Safe degradation through UNKNOWN fallback  
+- Flexibility for the Policy Module to adapt behavior under uncertainty  
+
+---
+
+## [Updated] Section 6.6.2 — Step 1: Hard Constraint Handling
+
+Apply all hard constraints to generate candidate set `H`.
+
+
+H = apply(hard_constraints)
+
+
+---
+
+### Case 1 — No Candidates Found
+
+
+if |H| == 0:
+state.hard_constraint_rejection_count += 1
+
+
+#### Subcase A — Repeated Failure (≥ 2 times)
+
+
+if state.hard_constraint_rejection_count >= 2:
+
+
+- Inform the user:
+  > "I've checked twice and no products match your strict requirements.  
+  > I can either relax some preferences or we can start a new search. What would you prefer?"
+
+- Action:
+
+ASK_CLARIFICATION (target = constraint_relaxation_or_reset)
+
+
+- Terminate current decision cycle (`STOP`)
+
+---
+
+#### Subcase B — First Failure
+
+
+else:
+
+
+- Inform the user that no products match the current hard constraints  
+
+- Identify the **most restrictive constraint** (e.g., lowest match rate or tightest bound)  
+
+- Ask the user to:
+  - Confirm the constraint, or  
+  - Relax / modify it  
+
+- Terminate current decision cycle (`STOP`)
+
+---
+
+### Case 2 — Candidates Found
+
+- Reset:
+
+state.hard_constraint_rejection_count = 0
+
 
 6.2.3 Intent Transition Rules
 From	To	Condition
@@ -710,6 +947,7 @@ EXPLORE or SEARCH	REFINE	Only valid if at least one recommendation has been show
 REFINE	REFINE	Always valid (chained refinements)
 Any	CHITCHAT	Always valid; system acknowledges and re-anchors
 Any	UNKNOWN	Always valid; system asks for clarification
+
 6.3 Policy Module
 
 The Policy Module is a fully deterministic component that maps (current_intent, dialogue_state) → action. It contains no LLM calls.
@@ -746,14 +984,15 @@ ELSE IF current_intent == REFINE:
         → UPDATE_WEIGHTS (dynamic weight adjustment)
         → RECOMMEND_ITEMS (re-query)
 
-IF user message contains "what do you know" or "summarize":
-    → SUMMARIZE (overrides other actions)
+ELSE IF current_intent == SUMMARIZE:
+    → SUMMARIZE (always valid; does not modify preferences)
 
 Minimum preferences before first recommendation:
 Category	Minimum Non-Null Fields
 Smartphone	2
 Laptop	2
 Washing Machine	1
+
 6.4 Action Space
 Action	Code	LLM Involved	Description
 Ask Clarification	ASK_CLARIFICATION	No (question selection) / Yes (phrasing)	Selects next question and phrases it naturally
@@ -919,6 +1158,7 @@ Processing: Applies the decision logic defined in Section 6.3
 Outputs: Action (enum), action arguments (dict)
 
 Testing: This component can be fully unit-tested without any LLM calls. 100% branch coverage is achievable and expected.
+
 7.3 Preference Extraction Node
 
 Role: Extracts structured preferences from user utterances, including fuzzy expression grounding.
@@ -943,34 +1183,123 @@ Step 5 — Validation (Deterministic):
 Validate all extracted values against the schema (correct types, plausible ranges). Flag and log invalid extractions without crashing.
 
 Outputs: Validated preference update dict, list of classified Constraint objects, list of fuzzy expressions used
-7.4 Semantic Query Builder
 
-Role: Constructs and embeds the semantic query representing the user's aggregated needs.
+## 7.4 Semantic Query Builder
 
-Inputs: Full DialogueState (all preferences, constraints, fuzzy expressions, history)
+**Role:**  
+Constructs and embeds a semantic query that accurately represents the user’s *current* needs, based strictly on the validated dialogue state.
 
-Processing:
+---
 
-    Aggregate all known user needs into a natural language string:
-        Start from stated preferences
-        Add fuzzy expressions verbatim
-        Add use-case signals from conversation history
-    Embed the aggregated query using text-embedding-3-small
-    Return embedding vector
+### Inputs
 
-Example aggregation:
+- Full `DialogueState`, including:
+  - Active structured preferences (e.g., price, brand, specs)
+  - Active `fuzzy_expressions` (e.g., "good camera", "lightweight")
+  - Explicit exclusions / rejected attributes
+  - Current inferred use-case (if available)
 
-text
+---
 
-Known: {os: Android, price_max: 600, min_battery_mah: 4500}
-Fuzzy: ["good camera", "lightweight"]
-History signals: "takes a lot of photos", "travels frequently"
+### Processing
 
-→ Semantic query: "Android phone under €600 with excellent 
-  camera quality and long battery life, lightweight and 
-  suitable for travel photography"
+#### Step 1 — State-Driven Query Reconstruction
 
-Outputs: Query embedding vector (1536-dim float array)
+Build the semantic query **only from the current validated state**, not from raw conversation history.
+
+Include:
+- Active (non-null) structured preferences  
+- Active fuzzy expressions  
+
+Exclude:
+- Any attributes that were removed, overridden, or rejected  
+- Verbatim historical utterances  
+
+This ensures the query reflects the **latest user intent**, not outdated constraints.
+
+---
+
+#### Step 2 — Negation Handling
+
+If a preference has been explicitly changed or rejected in a REFINE turn, it must be removed from the query.
+
+**Example:**
+
+Previous: "good camera"
+Refined to: "better battery"
+
+
+→ Updated query:
+- Drops camera-related terms  
+- Emphasizes battery life and efficiency  
+
+This prevents stale or conflicting signals in the embedding.
+
+---
+
+#### Step 3 — Query Templating
+
+Construct a concise natural language query using a deterministic template:
+
+
+"[Category] with [active preferences], [active fuzzy expressions], suitable for [use-case]"
+
+
+**Example:**
+
+**State:**
+
+os: Android
+price_max: 600
+min_battery_mah: 4500
+fuzzy: ["lightweight", "long battery life"]
+use_case: "travel photography"
+
+
+**Generated Query:**
+
+"Android phone under €600 with long battery life, lightweight, suitable for travel photography"
+
+
+---
+
+#### Step 4 — Embedding
+
+Embed the reconstructed query using:
+
+
+text-embedding-3-small → 1536-dimensional vector
+
+
+Optimization:
+- Cache the embedding in:
+
+state.last_semantic_query_embedding
+
+- Reuse cached embedding if the DialogueState has not changed  
+- Avoid redundant API calls and reduce latency  
+
+---
+
+### Output
+
+- Query embedding vector  
+- Type: `float[1536]`  
+- Represents the **current, cleaned, and intent-aligned semantic query**
+
+---
+
+### Key Improvement
+
+This design eliminates **stale preference leakage** from earlier turns:
+
+- Only current state is used (no full history concatenation)  
+- REFINE operations correctly update semantic intent  
+- Embeddings remain consistent with the latest user requirements  
+- Improves retrieval precision and ranking stability  
+
+---
+
 7.5 Hybrid Recommendation Node
 
 Role: Combines structured filtering with semantic retrieval to produce a final ranked product list with explanations.
@@ -1076,6 +1405,8 @@ Inputs: DialogueState (asked_attributes, preferences, category)
 Processing: As defined in Section 6.5.2.
 
 Outputs: (attribute_name, question_template)
+
+
 7.8 Response Generator Node
 
 Role: Converts structured outputs into natural, contextually appropriate language.
@@ -1084,7 +1415,13 @@ Inputs: Action executed, structured output of that action, last 2 turns of histo
 
 Processing:
 
-For ASK_CLARIFICATION: Inject question template into natural phrasing. Light LLM call to vary phrasing across turns (prevents robotic repetition). LLM is grounded — it may only rephrase the given question, not add new questions.
+For ASK_CLARIFICATION:
+    • Inject question template into natural phrasing via light LLM call
+    • Post-generation validation (deterministic):
+        - Count question marks: must be exactly 1
+        - Check that no unrequested attributes are mentioned
+        - If validation fails: bypass LLM output and return deterministic template directly
+    • Log validation result to LangSmith
 
 For RECOMMEND_ITEMS / REFINE_RESULTS: Assemble structured recommendation response using templates. Include explanations from Recommendation Node. Add constraint relaxation notice if applicable. No LLM involvement in product facts — all numbers come directly from the database.
 
@@ -1095,6 +1432,8 @@ For HANDLE_ERROR: Template-based response, no LLM.
 Outputs: System response string, structured product data for UI rendering
 
 Key principle: The Response Generator never invents product facts. All specifications, prices, and feature statements are populated from database records, not LLM generation. The LLM only handles phrasing and connective language.
+
+
 7.9 Error Handler Node
 
 Role: Provides safe, graceful responses for all failure modes.
