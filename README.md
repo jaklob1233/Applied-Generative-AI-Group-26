@@ -16,9 +16,8 @@ crs_project/
 │
 ├── app.py                # Streamlit chat UI  ← main entry point
 ├── test_cli.py           # CLI test (no UI needed)
-├── generate_data.py      # Generate synthetic product CSVs
 │
-└── products/             # Auto-created by generate_data.py
+└── products/             # Place your product CSVs here
     ├── smartphones.csv
     ├── washing_machines.csv
     └── laptops.csv
@@ -46,12 +45,6 @@ Get your keys:
 - **Anthropic**: https://console.anthropic.com/
 - **LangSmith** (free for students): https://smith.langchain.com/
 
-### 3. Generate product data
-```bash
-python generate_data.py
-```
-This calls the LLM to generate ~210 synthetic products across 3 categories and saves them to `products/`.
-
 ### 4. Run the app
 
 **Streamlit UI (recommended):**
@@ -63,6 +56,8 @@ streamlit run app.py
 ```bash
 python test_cli.py
 ```
+
+Note: The app expects product CSVs under `products/` (see `database.py:load_all()` for filenames).
 
 ---
 
