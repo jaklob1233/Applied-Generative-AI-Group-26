@@ -3,3 +3,9 @@
 
 # DS_Store
 .DS_Store
+
+# Environment files
+.env
+
+# Python cache
+__pycache__/

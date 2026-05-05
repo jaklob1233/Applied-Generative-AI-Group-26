@@ -10,24 +10,23 @@ from typing import Dict, Any, List, Optional
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 
-DATA_DIR = Path("products")
+DATA_DIR = Path("datasets")
 
 _dataframes: Dict[str, pd.DataFrame] = {}
 
 def load_all() -> None:
     """Call once at startup to load all CSVs."""
     files = {
-        "smartphone":     "smartphones.csv",
-        "washing_machine": "washing_machines.csv",
-        "laptop":         "laptops.csv",
+        "smartphone": "reduced_file_smartphone_500.csv",
+        "headphones": "reduced_file_headphones_500.csv",
     }
     for category, filename in files.items():
         path = DATA_DIR / filename
         if path.exists():
             _dataframes[category] = pd.read_csv(path)
-            print(f"  ✓ Loaded {len(_dataframes[category])} {category}s")
+            print(f"  [OK] Loaded {len(_dataframes[category])} {category}s")
         else:
-            print(f"  ⚠ Missing {path} — run generate_data.py first")
+            print(f"  [WARNING] Missing {path} - add your CSV files to the datasets/ folder")
 
 def get_categories() -> List[str]:
     return list(_dataframes.keys())
@@ -67,10 +66,11 @@ def _apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
             # Exact match (case-insensitive for strings)
             if key in df.columns:
                 col_dtype = df[key].dtype
-                if col_dtype == object:
-                    df = df[df[key].astype(str).str.lower() == str(value).lower()]
-                elif col_dtype == bool:
+                if col_dtype == bool:
                     df = df[df[key] == bool(value)]
+                elif col_dtype == object or isinstance(value, str):
+                    # Always treat as string if either the column or the value is a string
+                    df = df[df[key].astype(str).str.lower() == str(value).lower()]
                 else:
                     df = df[pd.to_numeric(df[key], errors="coerce") == float(value)]
 

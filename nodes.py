@@ -18,12 +18,27 @@ from state import DialogueState
 # ── LLM factory ───────────────────────────────────────────────────────────────
 
 def _get_llm():
-    provider = os.getenv("LLM_PROVIDER", "openai")
+    provider = os.getenv("LLM_PROVIDER", "openrouter")
+
     if provider == "anthropic":
         from langchain_anthropic import ChatAnthropic
         return ChatAnthropic(model="claude-3-haiku-20240307", temperature=0)
-    from langchain_openai import ChatOpenAI
-    return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    elif provider == "openai":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(model="gpt-4o-mini", temperature=0)
+
+    elif provider == "openrouter":
+        from langchain_openai import ChatOpenAI
+        return ChatOpenAI(
+            model=os.getenv("OPENROUTER_MODEL", "mistralai/mistral-7b-instruct"),
+            openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+            openai_api_base="https://openrouter.ai/api/v1",
+            temperature=0,
+        )
+
+    else:
+        raise ValueError(f"Unknown LLM_PROVIDER: '{provider}'. Choose from: openai, anthropic, openrouter")
 
 llm = _get_llm()
 
