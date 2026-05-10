@@ -95,8 +95,14 @@ with st.sidebar:
     st.subheader("Active Filters")
     filters = ds.get("active_filters", {})
     if filters:
+        PRICE_LABELS = {
+            "price_min":     "Price min (₹)",
+            "price_max":     "Price max (₹)",
+            "price_usd_min": "Price min ($)",
+            "price_usd_max": "Price max ($)",
+        }
         for k, v in filters.items():
-            label = k.replace("_", " ").replace(" eur", " (€)").title()
+            label = PRICE_LABELS.get(k, k.replace("_", " ").title())
             st.markdown(f'<span class="filter-pill">**{label}**: {v}</span>', unsafe_allow_html=True)
     else:
         st.caption("No filters yet")
@@ -133,19 +139,79 @@ with st.sidebar:
         debug_state = {k: v for k, v in ds.items() if k != "messages"}
         st.code(json.dumps(debug_state, indent=2, default=str), language="json")
 
+# ── Product card renderer ────────────────────────────────────────────────────
+
+def _render_product_card(product: dict, category: str):
+    """Render a styled product card below the chat response."""
+
+    def _val(key, default="—"):
+        v = product.get(key)
+        if v is None:
+            return default
+        if isinstance(v, float) and v != v:  # NaN
+            return default
+        return v
+
+    def _truthy(key):
+        return str(product.get(key, "")).lower() == "true"
+
+    if category == "smartphone":
+        brand = _val("brand_name", "")
+        model = _val("model", "")
+        price = product.get("price")
+        price_str = (
+            f"₹{int(price):,}"
+            if isinstance(price, (int, float)) and price == price
+            else "—"
+        )
+        specs = (
+            f"📱 {_val('screen_size')}\" • "
+            f"🔋 {_val('battery_capacity')} mAh • "
+            f"📸 {_val('primary_camera_rear')} MP • "
+            f"💾 {_val('ram_capacity')} GB / {_val('internal_memory')} GB • "
+            f"{str(_val('os', '')).upper()}"
+        )
+    elif category == "headphones":
+        brand = _val("brand", "")
+        model = _val("model", "")
+        price = product.get("price_usd")
+        price_str = (
+            f"${int(price)}"
+            if isinstance(price, (int, float)) and price == price
+            else "—"
+        )
+        parts = [f"🎧 {_val('form_factor')}", f"🔌 {_val('type')}"]
+        if product.get("type") == "Wireless":
+            parts.append(f"🔋 {_val('battery_hrs')} hrs")
+        if _truthy("noise_cancellation"):
+            parts.append("🔇 NC")
+        if _truthy("microphone"):
+            parts.append("🎙 mic")
+        specs = " • ".join(parts)
+    else:
+        brand, model, price_str, specs = "", "", "—", ""
+
+    st.markdown(
+        f"""<div class="product-card">
+        <strong>{brand} {model}</strong> — <strong>{price_str}</strong><br>
+        <small>{specs}</small>
+        </div>""",
+        unsafe_allow_html=True,
+    )
+
 # ── Main chat area ────────────────────────────────────────────────────────────
 
 col1, col2 = st.columns([3, 1])
 
 with col1:
     st.title("🛍️ Product Assistant")
-    st.caption("I'll help you find the perfect smartphone, laptop, or washing machine.")
+    st.caption("I'll help you find the perfect smartphone or pair of headphones.")
 
 # Welcome message
 if st.session_state.show_welcome:
     with st.chat_message("assistant"):
         st.markdown(
-            "👋 Welcome! I'm your personal product assistant. I can help you find the perfect **smartphone**, **laptop**, or **washing machine**.\n\n"
+            "👋 Welcome! I'm your personal product assistant. I can help you find the perfect **smartphone** or **headphones**.\n\n"
             "Just tell me what you're looking for, and I'll ask a few questions to narrow down the best options for you. What can I help you with today?"
         )
     st.session_state.show_welcome = False
@@ -181,48 +247,3 @@ if user_input := st.chat_input("Tell me what you're looking for..."):
 
     st.session_state.chat_messages.append({"role": "assistant", "content": response})
     st.rerun()
-
-
-# ── Product card renderer ─────────────────────────────────────────────────────
-
-def _render_product_card(product: dict, category: str):
-    """Render a styled product card below the chat response."""
-    brand = product.get("brand", "")
-    model = product.get("model", "")
-    price = product.get("price_eur", "?")
-
-    # Category-specific key specs
-    if category == "smartphone":
-        specs = (
-            f"📱 {product.get('display_inches', '?')}\" display • "
-            f"🔋 {product.get('battery_mah', '?')} mAh • "
-            f"📸 {product.get('camera_mp', '?')} MP • "
-            f"💾 {product.get('ram_gb', '?')} GB RAM / {product.get('storage_gb', '?')} GB • "
-            f"{'5G ✓' if product.get('has_5g') else '4G'}"
-        )
-    elif category == "washing_machine":
-        specs = (
-            f"🫧 {product.get('capacity_kg', '?')} kg • "
-            f"⚡ Class {product.get('energy_class', '?')} • "
-            f"🔊 {product.get('noise_db', '?')} dB • "
-            f"🔄 {product.get('spin_rpm', '?')} rpm • "
-            f"{'Steam ✓' if product.get('has_steam') else ''}"
-        )
-    elif category == "laptop":
-        specs = (
-            f"💻 {product.get('display_inches', '?')}\" • "
-            f"🧠 {product.get('ram_gb', '?')} GB RAM • "
-            f"💾 {product.get('storage_gb', '?')} GB SSD • "
-            f"🎮 {product.get('gpu_type', '?')} GPU • "
-            f"⚖️ {product.get('weight_kg', '?')} kg"
-        )
-    else:
-        specs = str(product)
-
-    st.markdown(
-        f"""<div class="product-card">
-        <strong>{brand} {model}</strong> — <strong>€{price}</strong><br>
-        <small>{specs}</small>
-        </div>""",
-        unsafe_allow_html=True,
-    )

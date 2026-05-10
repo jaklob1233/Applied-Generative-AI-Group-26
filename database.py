@@ -14,6 +14,30 @@ DATA_DIR = Path("datasets")
 
 _dataframes: Dict[str, pd.DataFrame] = {}
 
+# Headphone CSV has columns with spaces/units. Normalize to snake_case on load
+# so filter keys stay clean across categories.
+_HEADPHONE_COLUMN_MAP = {
+    "Brand": "brand",
+    "Model": "model",
+    "Type": "type",
+    "Connectivity": "connectivity",
+    "Freq Low (Hz)": "freq_low_hz",
+    "Freq High (Hz)": "freq_high_hz",
+    "Cable Length (m)": "cable_length_m",
+    "Microphone": "microphone",
+    "Noise Cancellation": "noise_cancellation",
+    "Foldable": "foldable",
+    "Battery (hrs)": "battery_hrs",
+    "BT Version": "bt_version",
+    "Charging Port": "charging_port",
+    "Color": "color",
+    "Price (USD)": "price_usd",
+    "Release Year": "release_year",
+    "Avg Rating": "avg_rating",
+    "Form Factor": "form_factor",
+}
+
+
 def load_all() -> None:
     """Call once at startup to load all CSVs."""
     files = {
@@ -22,11 +46,14 @@ def load_all() -> None:
     }
     for category, filename in files.items():
         path = DATA_DIR / filename
-        if path.exists():
-            _dataframes[category] = pd.read_csv(path)
-            print(f"  [OK] Loaded {len(_dataframes[category])} {category}s")
-        else:
+        if not path.exists():
             print(f"  [WARNING] Missing {path} - add your CSV files to the datasets/ folder")
+            continue
+        df = pd.read_csv(path)
+        if category == "headphones":
+            df = df.rename(columns=_HEADPHONE_COLUMN_MAP)
+        _dataframes[category] = df
+        print(f"  [OK] Loaded {len(df)} {category}")
 
 def get_categories() -> List[str]:
     return list(_dataframes.keys())
@@ -37,11 +64,11 @@ def _apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
     """
     Apply structured filters to a DataFrame.
     Supported filter keys follow the convention:
-      <field>          → exact match  (e.g. brand="Samsung")
-      <field>_min      → >= threshold (e.g. battery_mah_min=4000)
-      <field>_max      → <= threshold (e.g. price_eur_max=500)
+      <field>          → exact match  (e.g. brand_name="samsung")
+      <field>_min      → >= threshold (e.g. battery_capacity_min=4000)
+      <field>_max      → <= threshold (e.g. price_max=30000)
       <field>_contains → case-insensitive substring (e.g. model_contains="pro")
-    Boolean fields: has_5g=True
+    Booleans: noise_cancellation=True (CSV strings "True"/"False" handled).
     """
     for key, value in filters.items():
         if value is None:
@@ -83,9 +110,11 @@ def retrieve(category: str, filters: Dict[str, Any], limit: int = 10) -> List[Di
         return []
     df = _dataframes[category].copy()
     df = _apply_filters(df, filters)
-    # Sort by price ascending by default
-    if "price_eur" in df.columns:
-        df = df.sort_values("price_eur")
+    # Sort by price ascending if available (column name varies by category)
+    for price_col in ("price", "price_usd", "price_eur"):
+        if price_col in df.columns:
+            df = df.sort_values(price_col)
+            break
     return df.head(limit).to_dict("records")
 
 
@@ -105,9 +134,14 @@ def most_discriminative_attribute(category: str, filters: Dict[str, Any]) -> Opt
 
     # Candidate attributes to ask about (categorical / low-cardinality)
     ASKABLE: Dict[str, List[str]] = {
-        "smartphone":     ["brand", "os", "price_eur", "ram_gb", "storage_gb", "has_5g"],
-        "washing_machine": ["brand", "capacity_kg", "energy_class", "load_type", "has_steam"],
-        "laptop":         ["brand", "os", "category", "ram_gb", "gpu_type", "price_eur"],
+        "smartphone": [
+            "brand_name", "os", "ram_capacity", "internal_memory",
+            "screen_size", "num_rear_cameras",
+        ],
+        "headphones": [
+            "brand", "type", "connectivity", "form_factor",
+            "noise_cancellation", "microphone", "foldable",
+        ],
     }
     candidates = ASKABLE.get(category, [])
 

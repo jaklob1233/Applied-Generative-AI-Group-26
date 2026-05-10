@@ -21,7 +21,7 @@ def main():
     print("="*60 + "\n")
 
     state = initial_state()
-    print("Assistant: Hi! I can help you find a smartphone, laptop, or washing machine. What are you looking for?\n")
+    print("Assistant: Hi! I can help you find a smartphone or pair of headphones. What are you looking for?\n")
 
     while True:
         try:

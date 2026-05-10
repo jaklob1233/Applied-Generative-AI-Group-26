@@ -79,35 +79,47 @@ def intent_and_extract_node(state: DialogueState) -> dict:
 
     prompt = f"""You are a preference extractor for a conversational product recommender.
 
-Available product categories: smartphone, washing_machine, laptop.
+Available product categories: smartphone, headphones.
 
 Analyze the user's latest message and return a JSON object with EXACTLY these fields:
 
 {{
   "intent": "<one of: explore | specific | refine | done | chitchat>",
-  "category": "<one of: smartphone | washing_machine | laptop | null>",
+  "category": "<one of: smartphone | headphones | null>",
   "extracted_filters": {{
-    // Structured filters extracted from this message only.
-    // Use these exact key conventions:
-    //   price_eur_max, price_eur_min   (integer)
-    //   brand                           (string, exact brand name)
-    //   os                              (iOS | Android | Windows | macOS | Linux)
-    //   ram_gb                          (integer)
-    //   storage_gb                      (integer)
-    //   battery_mah_min                 (integer, smartphones)
-    //   display_inches_min/max          (float)
-    //   camera_mp_min                   (integer, smartphones)
-    //   has_5g                          (true | false, smartphones)
-    //   capacity_kg                     (integer, washing machines)
-    //   energy_class                    (A | B | C | D, washing machines)
-    //   load_type                       (front | top, washing machines)
-    //   noise_db_max                    (integer, washing machines)
-    //   has_steam                       (true | false, washing machines)
-    //   gpu_type                        (integrated | dedicated, laptops)
-    //   category                        (ultrabook|gaming|workstation|budget|2-in-1, laptops)
-    //   weight_kg_max                   (float, laptops)
+    // Structured filters extracted from THIS message only.
+    // Only include fields the user explicitly mentioned.
+    // Use null to REMOVE a previously-set filter (user changed their mind).
+    // String matching is case-insensitive.
     //
-    // Only include fields the user explicitly mentioned. Use null to REMOVE a filter.
+    // === Smartphone filters ===
+    //   brand_name                              (string, e.g. "samsung", "apple", "xiaomi", "oneplus")
+    //   model_contains                          (string, substring of model name)
+    //   price_min, price_max                    (integer, INR — typical range 4000-240000)
+    //   rating_min                              (number, 0-100 scale, typical 60-89)
+    //   battery_capacity_min                    (integer, mAh)
+    //   fast_charging_min                       (integer, watts)
+    //   ram_capacity, ram_capacity_min          (integer, GB)
+    //   internal_memory, internal_memory_min    (integer, GB)
+    //   screen_size_min, screen_size_max        (number, inches)
+    //   num_rear_cameras_min                    (integer)
+    //   os                                      ("android" | "ios" | "other")
+    //   primary_camera_rear_min                 (number, MP)
+    //   primary_camera_front_min                (number, MP)
+    //
+    // === Headphones filters ===
+    //   brand                                   (string, e.g. "Sony", "Bose", "Sennheiser")
+    //   model_contains                          (string)
+    //   type                                    ("Wired" | "Wireless")
+    //   connectivity                            ("3.5mm" | "Bluetooth")
+    //   form_factor                             ("In-Ear" | "On-Ear" | "Over-Ear")
+    //   microphone                              (true | false)
+    //   noise_cancellation                      (true | false)
+    //   foldable                                (true | false)
+    //   battery_hrs_min                         (number, hours — wireless only)
+    //   price_usd_min, price_usd_max            (integer, USD — typical range 50-940)
+    //   avg_rating_min                          (number, 0-5 scale)
+    //   release_year_min, release_year_max      (integer)
   }}
 }}
 
@@ -219,6 +231,12 @@ def response_generator_node(state: DialogueState) -> dict:
     """
     action = state["action"]
     category = state["category"] or "products"
+    # Human-readable plural for the assistant prose (avoids "headphoness").
+    CATEGORY_LABEL = {
+        "smartphone": "smartphones",
+        "headphones": "headphones",
+    }
+    category_label = CATEGORY_LABEL.get(category, category)
     filters_summary = json.dumps(state["active_filters"], indent=2) if state["active_filters"] else "none"
 
     # Format top candidates for the prompt
@@ -236,7 +254,7 @@ def response_generator_node(state: DialogueState) -> dict:
     action_instructions = {
         "ask_category": (
             "Greet the user warmly and ask which product category they are interested in. "
-            f"Mention the available categories: smartphone, washing machine, or laptop."
+            "Mention the available categories: smartphones or headphones."
         ),
         "ask_clarification": (
             f"You have {len(state['candidates'])} products matching the current filters. "
@@ -260,7 +278,7 @@ def response_generator_node(state: DialogueState) -> dict:
         ),
     }.get(action, "Respond helpfully to the user.")
 
-    prompt = f"""You are a friendly, knowledgeable shop assistant helping a customer find {category}s.
+    prompt = f"""You are a friendly, knowledgeable shop assistant helping a customer find {category_label}.
 
 Your task: {action_instructions}
 

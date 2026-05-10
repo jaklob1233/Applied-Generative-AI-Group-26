@@ -16,7 +16,7 @@ class DialogueState(TypedDict):
     extracted_filters: Dict[str, Any]  # filters extracted from THIS turn only
 
     # ── Persistent dialogue state (accumulated across turns) ──────────────────
-    category: Optional[str]          # smartphone | washing_machine | laptop | None
+    category: Optional[str]          # smartphone | headphones | None
     active_filters: Dict[str, Any]   # merged filters from all turns so far
 
     # ── Action & retrieval ────────────────────────────────────────────────────
