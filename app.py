@@ -29,16 +29,6 @@ st.markdown("""
     /* Main chat area */
     .main .block-container { padding-top: 2rem; }
 
-    /* Product card styling */
-    .product-card {
-        background: #f8f9fa;
-        border-left: 4px solid #0066cc;
-        border-radius: 8px;
-        padding: 12px 16px;
-        margin: 8px 0;
-        font-size: 0.9em;
-    }
-
     /* Filter tag pill */
     .filter-pill {
         display: inline-block;
@@ -96,8 +86,6 @@ with st.sidebar:
     filters = ds.get("active_filters", {})
     if filters:
         PRICE_LABELS = {
-            "price_min":     "Price min (₹)",
-            "price_max":     "Price max (₹)",
             "price_usd_min": "Price min ($)",
             "price_usd_max": "Price max ($)",
         }
@@ -139,65 +127,80 @@ with st.sidebar:
         debug_state = {k: v for k, v in ds.items() if k != "messages"}
         st.code(json.dumps(debug_state, indent=2, default=str), language="json")
 
-# ── Product card renderer ────────────────────────────────────────────────────
+# ── Comparison table renderer ───────────────────────────────────────────────
 
-def _render_product_card(product: dict, category: str):
-    """Render a styled product card below the chat response."""
+def _render_comparison_table(products, category):
+    """Render a side-by-side spec comparison of the top recommended products."""
+    import pandas as pd
 
-    def _val(key, default="—"):
-        v = product.get(key)
-        if v is None:
-            return default
-        if isinstance(v, float) and v != v:  # NaN
-            return default
-        return v
+    if not products:
+        return
 
-    def _truthy(key):
-        return str(product.get(key, "")).lower() == "true"
+    def cell(p, key, fmt=str):
+        v = p.get(key)
+        if v is None or (isinstance(v, float) and v != v):  # None or NaN
+            return "—"
+        try:
+            return fmt(v)
+        except Exception:
+            return "—"
+
+    def truthy(v):
+        return str(v).lower() == "true"
+
+    def freq_range(p):
+        lo, hi = p.get("freq_low_hz"), p.get("freq_high_hz")
+        bad = lambda v: v is None or (isinstance(v, float) and v != v)
+        if bad(lo) or bad(hi):
+            return "—"
+        return f"{int(lo)}–{int(hi)} Hz"
 
     if category == "smartphone":
-        brand = _val("brand_name", "")
-        model = _val("model", "")
-        price = product.get("price")
-        price_str = (
-            f"₹{int(price):,}"
-            if isinstance(price, (int, float)) and price == price
-            else "—"
-        )
-        specs = (
-            f"📱 {_val('screen_size')}\" • "
-            f"🔋 {_val('battery_capacity')} mAh • "
-            f"📸 {_val('primary_camera_rear')} MP • "
-            f"💾 {_val('ram_capacity')} GB / {_val('internal_memory')} GB • "
-            f"{str(_val('os', '')).upper()}"
-        )
+        rows = [
+            ("Brand",        lambda p: cell(p, "brand_name", lambda v: str(v).title())),
+            ("Model",        lambda p: cell(p, "model")),
+            ("Price",        lambda p: cell(p, "price_usd", lambda v: f"${int(v):,}")),
+            ("OS",           lambda p: cell(p, "os", lambda v: str(v).upper())),
+            ("RAM",          lambda p: cell(p, "ram_capacity", lambda v: f"{int(v)} GB")),
+            ("Storage",      lambda p: cell(p, "internal_memory", lambda v: f"{int(v)} GB")),
+            ("Battery",      lambda p: cell(p, "battery_capacity", lambda v: f"{int(v)} mAh")),
+            ("Rear Camera",  lambda p: cell(p, "primary_camera_rear", lambda v: f"{int(v)} MP")),
+            ("Front Camera", lambda p: cell(p, "primary_camera_front", lambda v: f"{int(v)} MP")),
+            ("Screen",       lambda p: cell(p, "screen_size", lambda v: f'{v}"')),
+            ("Score",        lambda p: f"{p.get('_score', '—')} / 100"),
+        ]
+        def name(p):
+            return f"{str(p.get('brand_name', '')).title()} {p.get('model', '')}".strip()
     elif category == "headphones":
-        brand = _val("brand", "")
-        model = _val("model", "")
-        price = product.get("price_usd")
-        price_str = (
-            f"${int(price)}"
-            if isinstance(price, (int, float)) and price == price
-            else "—"
-        )
-        parts = [f"🎧 {_val('form_factor')}", f"🔌 {_val('type')}"]
-        if product.get("type") == "Wireless":
-            parts.append(f"🔋 {_val('battery_hrs')} hrs")
-        if _truthy("noise_cancellation"):
-            parts.append("🔇 NC")
-        if _truthy("microphone"):
-            parts.append("🎙 mic")
-        specs = " • ".join(parts)
+        rows = [
+            ("Brand",              lambda p: cell(p, "brand")),
+            ("Model",              lambda p: cell(p, "model")),
+            ("Price",              lambda p: cell(p, "price_usd", lambda v: f"${int(v)}")),
+            ("Type",               lambda p: cell(p, "type")),
+            ("Form Factor",        lambda p: cell(p, "form_factor")),
+            ("Connectivity",       lambda p: cell(p, "connectivity")),
+            ("Noise Cancellation", lambda p: "Yes" if truthy(p.get("noise_cancellation")) else "No"),
+            ("Microphone",         lambda p: "Yes" if truthy(p.get("microphone")) else "No"),
+            ("Foldable",           lambda p: "Yes" if truthy(p.get("foldable")) else "No"),
+            ("Battery (hrs)",      lambda p: cell(p, "battery_hrs", lambda v: f"{v}") if str(p.get("type", "")).lower() == "wireless" else "—"),
+            ("Freq Range",         freq_range),
+            ("Avg Rating",         lambda p: cell(p, "avg_rating", lambda v: f"{v} / 5")),
+            ("Release Year",       lambda p: cell(p, "release_year", lambda v: str(int(v)))),
+            ("Score",              lambda p: f"{p.get('_score', '—')} / 100"),
+        ]
+        def name(p):
+            return f"{p.get('brand', '')} {p.get('model', '')}".strip()
     else:
-        brand, model, price_str, specs = "", "", "—", ""
+        return
 
-    st.markdown(
-        f"""<div class="product-card">
-        <strong>{brand} {model}</strong> — <strong>{price_str}</strong><br>
-        <small>{specs}</small>
-        </div>""",
-        unsafe_allow_html=True,
-    )
+    # Column headers from brand+model; disambiguate identical names
+    headers = [name(p) or "Product" for p in products]
+    if len(set(headers)) < len(headers):
+        headers = [f"{h} ({i+1})" for i, h in enumerate(headers)]
+
+    data = {col: [fn(p) for _, fn in rows] for col, p in zip(headers, products)}
+    df = pd.DataFrame(data, index=[label for label, _ in rows])
+    st.table(df)
 
 # ── Main chat area ────────────────────────────────────────────────────────────
 
@@ -216,10 +219,14 @@ if st.session_state.show_welcome:
         )
     st.session_state.show_welcome = False
 
-# Render chat history
+# Render chat history (including any saved comparison tables)
 for msg in st.session_state.chat_messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
+        if msg.get("table_products"):
+            st.divider()
+            st.caption("**Comparison:**")
+            _render_comparison_table(msg["table_products"], msg["table_category"])
 
 # ── Chat input ────────────────────────────────────────────────────────────────
 
@@ -238,12 +245,18 @@ if user_input := st.chat_input("Tell me what you're looking for..."):
         response = new_state["response"]
         st.markdown(response)
 
-        # If recommendations were made, show product cards below the response
-        if new_state["action"] == "recommend" and new_state["candidates"]:
+        # If we just recommended, render the comparison table beneath the reply
+        is_recommend = new_state["action"] == "recommend" and new_state["candidates"]
+        if is_recommend:
             st.divider()
-            st.caption("**Recommended products:**")
-            for product in new_state["candidates"][:3]:
-                _render_product_card(product, new_state["category"])
+            st.caption("**Comparison:**")
+            _render_comparison_table(new_state["candidates"][:2], new_state["category"])
 
-    st.session_state.chat_messages.append({"role": "assistant", "content": response})
+    # Persist the assistant turn; include the comparison products so the table
+    # re-renders on subsequent reruns from chat history.
+    chat_entry = {"role": "assistant", "content": response}
+    if is_recommend:
+        chat_entry["table_products"] = new_state["candidates"][:2]
+        chat_entry["table_category"] = new_state["category"]
+    st.session_state.chat_messages.append(chat_entry)
     st.rerun()

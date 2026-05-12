@@ -66,7 +66,7 @@ def _apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
     Supported filter keys follow the convention:
       <field>          → exact match  (e.g. brand_name="samsung")
       <field>_min      → >= threshold (e.g. battery_capacity_min=4000)
-      <field>_max      → <= threshold (e.g. price_max=30000)
+      <field>_max      → <= threshold (e.g. price_usd_max=300)
       <field>_contains → case-insensitive substring (e.g. model_contains="pro")
     Booleans: noise_cancellation=True (CSV strings "True"/"False" handled).
     """
@@ -110,57 +110,169 @@ def retrieve(category: str, filters: Dict[str, Any], limit: int = 10) -> List[Di
         return []
     df = _dataframes[category].copy()
     df = _apply_filters(df, filters)
-    # Sort by price ascending if available (column name varies by category)
-    for price_col in ("price", "price_usd", "price_eur"):
-        if price_col in df.columns:
-            df = df.sort_values(price_col)
-            break
+    # Sort by price ascending. Both categories use `price_usd` after the
+    # one-time INR→USD conversion on 2026-05-12 (rate 1 INR = 0.010485 USD).
+    if "price_usd" in df.columns:
+        df = df.sort_values("price_usd")
     return df.head(limit).to_dict("records")
 
 
-def most_discriminative_attribute(category: str, filters: Dict[str, Any]) -> Optional[str]:
+# ── Dialogue: fixed question order per category ───────────────────────────────
+#
+# The recommender follows this fixed sequence — picking the first attribute the
+# user hasn't either answered (via a filter) or explicitly skipped.
+
+QUESTION_ORDER: Dict[str, List[str]] = {
+    "smartphone": [
+        "os",
+        "price_usd",
+        "battery_capacity",
+        "primary_camera_rear",
+        "ram_capacity",
+        "internal_memory",
+    ],
+    "headphones": [
+        "type",
+        "form_factor",
+        "noise_cancellation",
+        "price_usd",
+    ],
+}
+
+
+def base_attr(filter_key: str) -> str:
+    """Strip _min / _max / _contains suffix to get the underlying attribute name."""
+    for suffix in ("_min", "_max", "_contains"):
+        if filter_key.endswith(suffix):
+            return filter_key[: -len(suffix)]
+    return filter_key
+
+
+def next_question(
+    category: str,
+    filters: Dict[str, Any],
+    asked_skipped: Optional[List[str]] = None,
+) -> Optional[str]:
     """
-    Among unfiltered attributes, return the one whose values are most varied
-    in the current candidate set — i.e. the best next question to ask.
+    Return the next attribute to ask the user about, or None if all questions
+    in QUESTION_ORDER have been answered or explicitly skipped.
     """
-    if category not in _dataframes:
-        return None
-
-    df = _dataframes[category].copy()
-    df = _apply_filters(df, filters)
-
-    if df.empty:
-        return None
-
-    # Candidate attributes to ask about (categorical / low-cardinality)
-    ASKABLE: Dict[str, List[str]] = {
-        "smartphone": [
-            "brand_name", "os", "ram_capacity", "internal_memory",
-            "screen_size", "num_rear_cameras",
-        ],
-        "headphones": [
-            "brand", "type", "connectivity", "form_factor",
-            "noise_cancellation", "microphone", "foldable",
-        ],
-    }
-    candidates = ASKABLE.get(category, [])
-
-    # Filter out already-constrained attributes
-    already_set = set()
-    for key in filters:
-        base = key.replace("_min", "").replace("_max", "").replace("_contains", "")
-        already_set.add(base)
-
-    best_attr = None
-    best_nunique = 0
-    for attr in candidates:
-        if attr in already_set:
+    order = QUESTION_ORDER.get(category, [])
+    answered = {base_attr(k) for k in (filters or {}).keys()}
+    skipped = set(asked_skipped or [])
+    for attr in order:
+        if attr in answered or attr in skipped:
             continue
-        if attr not in df.columns:
-            continue
-        n = df[attr].nunique()
-        if n > best_nunique:
-            best_nunique = n
-            best_attr = attr
+        return attr
+    return None
 
-    return best_attr
+
+# ── Scoring: weighted-feature score (0-100) for picking top recommendations ───
+
+_SMARTPHONE_WEIGHTS = {
+    # attribute              (weight, direction)
+    "price_usd":            (25, "lower"),
+    "primary_camera_rear":  (20, "higher"),
+    "battery_capacity":     (20, "higher"),
+    "ram_capacity":         (15, "higher"),
+    "internal_memory":      (15, "higher"),
+    "rating":               (5,  "higher"),
+}
+
+_HEADPHONES_WEIGHTS = {
+    "price_usd":            (25, "lower"),
+    "avg_rating":           (30, "higher"),
+    "battery_hrs":          (20, "higher"),
+    "freq_range":           (10, "higher"),   # derived: freq_high_hz - freq_low_hz
+    "noise_cancellation":   (15, "binary"),
+}
+
+_WEIGHTS_BY_CATEGORY = {
+    "smartphone": _SMARTPHONE_WEIGHTS,
+    "headphones": _HEADPHONES_WEIGHTS,
+}
+
+
+def _is_nan(v: Any) -> bool:
+    return isinstance(v, float) and v != v
+
+
+def _normalize_to_score(values: List[Any], mode: str) -> List[float]:
+    """Map values to a 0-100 score using min-max within the candidate set."""
+    if mode == "binary":
+        return [100.0 if str(v).lower() == "true" else 0.0 for v in values]
+
+    nums: List[float] = []
+    for v in values:
+        if v is None or _is_nan(v):
+            continue
+        try:
+            nums.append(float(v))
+        except (TypeError, ValueError):
+            continue
+    if not nums:
+        return [50.0] * len(values)
+
+    vmin, vmax = min(nums), max(nums)
+    if vmax == vmin:
+        return [50.0] * len(values)
+
+    out: List[float] = []
+    for v in values:
+        if v is None or _is_nan(v):
+            out.append(50.0)
+            continue
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            out.append(50.0)
+            continue
+        if mode == "higher":
+            out.append(100.0 * (x - vmin) / (vmax - vmin))
+        else:  # "lower"
+            out.append(100.0 * (vmax - x) / (vmax - vmin))
+    return out
+
+
+def score_candidates(category: str, candidates: List[Dict]) -> List[float]:
+    """Return a 0-100 weighted score per candidate (same order as input)."""
+    weights = _WEIGHTS_BY_CATEGORY.get(category)
+    if not weights or not candidates:
+        return [0.0] * len(candidates)
+
+    attr_scores: Dict[str, List[float]] = {}
+    for attr, (_, mode) in weights.items():
+        if attr == "freq_range":
+            values = [
+                (c.get("freq_high_hz") or 0) - (c.get("freq_low_hz") or 0)
+                for c in candidates
+            ]
+        else:
+            values = [c.get(attr) for c in candidates]
+        attr_scores[attr] = _normalize_to_score(values, mode)
+
+    total_weight = sum(w for w, _ in weights.values())
+    final: List[float] = []
+    for i in range(len(candidates)):
+        s = sum(
+            attr_scores[a][i] * weights[a][0] / total_weight
+            for a in weights
+        )
+        final.append(s)
+    return final
+
+
+def top_n_by_score(category: str, candidates: List[Dict], n: int = 2) -> List[Dict]:
+    """
+    Pick the top-n candidates by weighted score. Ties are broken randomly.
+    Each returned dict includes a '_score' key (rounded to 1 decimal).
+    """
+    import random
+
+    if not candidates:
+        return []
+    scores = score_candidates(category, candidates)
+    pairs = list(zip(candidates, scores))
+    random.shuffle(pairs)               # random order for ties
+    pairs.sort(key=lambda p: p[1], reverse=True)  # stable sort preserves shuffle for ties
+    return [{**c, "_score": round(s, 1)} for c, s in pairs[:n]]

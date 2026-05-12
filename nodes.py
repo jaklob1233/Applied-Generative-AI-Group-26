@@ -67,35 +67,57 @@ def _recent_history(state: DialogueState, n: int = 6) -> str:
     return "\n".join(lines) or "(start of conversation)"
 
 
+# ── Per-attribute explanations (woven into clarification questions) ──────────
+
+ATTRIBUTE_HINTS: Dict[str, Dict[str, str]] = {
+    "smartphone": {
+        "os": "Operating system — Android (open, wide hardware choice) or iOS (tight integration with Apple devices). 'Other' covers less common OSes.",
+        "price_usd": "Budget in US Dollars. Dataset range is roughly $40 to $2,500.",
+        "battery_capacity": "Battery in mAh — higher = longer life. 4,000-5,000 mAh comfortably lasts a day.",
+        "primary_camera_rear": "Main rear camera in megapixels. 48-64 MP is mid-range, 100+ MP is flagship territory.",
+        "ram_capacity": "RAM in GB — affects multitasking smoothness. 4 GB is okay for casual use, 8-12 GB for heavy multitasking and gaming.",
+        "internal_memory": "Internal storage in GB. 64 GB is tight for media, 128 GB is comfortable, 256 GB+ is generous.",
+    },
+    "headphones": {
+        "type": "Wired or Wireless? Wireless gives mobility; wired avoids batteries and pairing.",
+        "form_factor": "Over-Ear (most immersive), On-Ear (compact and lighter), or In-Ear (most portable, gym-friendly).",
+        "noise_cancellation": "Active noise cancellation blocks ambient noise — great for flights and commutes.",
+        "price_usd": "Budget in US Dollars. Dataset range is $50 to $940.",
+    },
+}
+
+
 # ── Node 1: Intent Classification + Preference Extraction ────────────────────
 
 def intent_and_extract_node(state: DialogueState) -> dict:
     """
-    Single LLM call that classifies intent and extracts structured filters.
-    Returns partial state update.
+    Single LLM call: classify intent, extract filters, identify category.
+    Does NOT update the persistent `category` field — that's the state_updater's
+    job (so it can detect category switches by comparing old vs new).
     """
     history = _recent_history(state)
     active = json.dumps(state["active_filters"], indent=2)
+    last_asked = state.get("last_asked_attribute") or "nothing in particular"
 
     prompt = f"""You are a preference extractor for a conversational product recommender.
 
 Available product categories: smartphone, headphones.
 
-Analyze the user's latest message and return a JSON object with EXACTLY these fields:
+Analyze the user's LATEST message and return a JSON object with EXACTLY these fields:
 
 {{
   "intent": "<one of: explore | specific | refine | done | chitchat>",
   "category": "<one of: smartphone | headphones | null>",
   "extracted_filters": {{
     // Structured filters extracted from THIS message only.
-    // Only include fields the user explicitly mentioned.
-    // Use null to REMOVE a previously-set filter (user changed their mind).
+    // Only include fields the user explicitly mentioned in this message.
+    // Use null as a VALUE to REMOVE a previously-set filter.
     // String matching is case-insensitive.
     //
     // === Smartphone filters ===
     //   brand_name                              (string, e.g. "samsung", "apple", "xiaomi", "oneplus")
     //   model_contains                          (string, substring of model name)
-    //   price_min, price_max                    (integer, INR — typical range 4000-240000)
+    //   price_usd_min, price_usd_max            (integer, USD — typical range $40-$2,500)
     //   rating_min                              (number, 0-100 scale, typical 60-89)
     //   battery_capacity_min                    (integer, mAh)
     //   fast_charging_min                       (integer, watts)
@@ -130,6 +152,19 @@ Intent definitions:
 - done: user is satisfied / wants to stop
 - chitchat: unrelated to product search
 
+CATEGORY SWITCHING:
+If the user pivots to a DIFFERENT product category mid-conversation (e.g. they
+were looking at smartphones and now say "now show me headphones" or "actually
+I want headphones"), return the NEW category in the "category" field. The
+system will reset all previous filters automatically. If the user is staying
+on the same category, you may return null for "category".
+
+SKIPPING A QUESTION:
+The assistant's previous question was about: "{last_asked}".
+If the user declines to specify (e.g. "any", "doesn't matter", "I don't care",
+"skip", "whatever", "either is fine"), simply DO NOT include a filter for that
+attribute. Don't invent a value.
+
 Current active filters: {active}
 Current category: {state['category'] or 'not set yet'}
 
@@ -143,13 +178,10 @@ Return ONLY the JSON object, no explanation."""
     response = llm.invoke(prompt)
     parsed = _parse_json_response(response.content)
 
-    # Determine category: keep existing if new one is null
-    new_category = parsed.get("category") or state["category"]
-
     return {
         "intent": parsed.get("intent", "explore"),
         "extracted_filters": parsed.get("extracted_filters", {}),
-        "category": new_category,
+        "extracted_category": parsed.get("category"),  # raw; state_updater decides what to do
     }
 
 
@@ -157,22 +189,61 @@ Return ONLY the JSON object, no explanation."""
 
 def state_updater_node(state: DialogueState) -> dict:
     """
-    Merges newly extracted filters into the persistent active_filters.
-    Pure Python — no LLM call.
-    - Non-null values overwrite existing filters
-    - Null values explicitly REMOVE a filter (user changed their mind)
-    """
-    updated = dict(state["active_filters"])
+    Merge newly extracted filters into active_filters, with two extra behaviors:
+      1. CATEGORY SWITCH: if the user pivots to a different non-null category,
+         reset active_filters and asked_skipped (start fresh).
+      2. SKIP DETECTION: if the user was asked about an attribute last turn
+         and didn't provide a filter for it (and isn't chitchatting), mark
+         that attribute as 'skipped' so we don't ask again.
 
-    for key, value in state["extracted_filters"].items():
+    Pure Python — no LLM call.
+    """
+    extracted = state["extracted_filters"]
+    extracted_category = state.get("extracted_category")
+    current_category = state["category"]
+    intent = state["intent"]
+    last_asked = state.get("last_asked_attribute")
+
+    # 1. Category switch → wipe filters + skipped list, keep only THIS turn's filters
+    if (
+        extracted_category
+        and current_category
+        and extracted_category != current_category
+    ):
+        return {
+            "category": extracted_category,
+            "active_filters": {k: v for k, v in extracted.items() if v is not None},
+            "asked_skipped": [],
+            "candidates": [],
+            "turn_count": state["turn_count"] + 1,
+        }
+
+    # 2. Otherwise: decide effective category (set first time, or keep current)
+    new_category = extracted_category or current_category
+
+    # 3. Merge filters (None removes a prior filter)
+    updated = dict(state["active_filters"])
+    for key, value in extracted.items():
         if value is None:
-            # Explicit removal
             updated.pop(key, None)
         else:
             updated[key] = value
 
+    # 4. Skip detection — only when user engaged with the search and didn't
+    #    answer the previous question.
+    updated_skipped = list(state.get("asked_skipped", []))
+    if (
+        last_asked
+        and intent not in (None, "chitchat", "done")
+        and last_asked not in updated_skipped
+        and not any(database.base_attr(k) == last_asked for k in updated)
+    ):
+        updated_skipped.append(last_asked)
+
     return {
+        "category": new_category,
         "active_filters": updated,
+        "asked_skipped": updated_skipped,
         "turn_count": state["turn_count"] + 1,
     }
 
@@ -181,7 +252,8 @@ def state_updater_node(state: DialogueState) -> dict:
 
 def retrieve_and_act_node(state: DialogueState) -> dict:
     """
-    Queries the database with current filters and decides the next action.
+    Query the database, decide the next action via the fixed question order,
+    and (when recommending) pick the top 2 products by weighted score.
     Pure Python — no LLM call.
     """
     # No category yet → must ask
@@ -190,35 +262,52 @@ def retrieve_and_act_node(state: DialogueState) -> dict:
             "action": "ask_category",
             "candidates": [],
             "clarification_attribute": None,
+            "last_asked_attribute": None,
         }
 
-    # User is done
+    # User signaled they're done
     if state["intent"] == "done":
         return {
             "action": "done",
             "candidates": [],
             "clarification_attribute": None,
+            "last_asked_attribute": None,
         }
 
-    candidates = database.retrieve(state["category"], state["active_filters"], limit=10)
+    # Pull a generous candidate pool so the scorer has a real population
+    candidates = database.retrieve(state["category"], state["active_filters"], limit=50)
 
     if len(candidates) == 0:
-        action = "no_results"
-        clarification_attribute = None
-    elif len(candidates) <= 3:
-        action = "recommend"
-        clarification_attribute = None
-    else:
-        # Too many results → ask the most discriminative question
-        action = "ask_clarification"
-        clarification_attribute = database.most_discriminative_attribute(
-            state["category"], state["active_filters"]
-        )
+        return {
+            "action": "no_results",
+            "candidates": [],
+            "clarification_attribute": None,
+            "last_asked_attribute": None,
+        }
 
+    next_q = database.next_question(
+        state["category"],
+        state["active_filters"],
+        state.get("asked_skipped", []),
+    )
+
+    # Recommend when either we've already narrowed enough OR there are no more
+    # questions to ask. Always present the top 2 by weighted score.
+    if len(candidates) <= 2 or next_q is None:
+        top = database.top_n_by_score(state["category"], candidates, n=2)
+        return {
+            "action": "recommend",
+            "candidates": top,
+            "clarification_attribute": None,
+            "last_asked_attribute": None,
+        }
+
+    # Still narrowing → ask the next attribute from the fixed sequence
     return {
-        "action": action,
+        "action": "ask_clarification",
         "candidates": candidates,
-        "clarification_attribute": clarification_attribute,
+        "clarification_attribute": next_q,
+        "last_asked_attribute": next_q,
     }
 
 
@@ -239,16 +328,19 @@ def response_generator_node(state: DialogueState) -> dict:
     category_label = CATEGORY_LABEL.get(category, category)
     filters_summary = json.dumps(state["active_filters"], indent=2) if state["active_filters"] else "none"
 
-    # Format top candidates for the prompt
-    top_candidates = state["candidates"][:3]
+    # Format top candidates for the prompt (recommend action picks 2)
+    top_candidates = state["candidates"][:2]
     candidates_text = ""
     if top_candidates:
         lines = []
         for p in top_candidates:
-            # Show most important fields, not the whole row
-            key_fields = {k: v for k, v in p.items() if k not in ("id",)}
-            lines.append(json.dumps(key_fields))
+            key_fields = {k: v for k, v in p.items() if k != "id"}
+            lines.append(json.dumps(key_fields, default=str))
         candidates_text = "\n".join(lines)
+
+    # Look up the explanation for the attribute we're about to ask about
+    attr = state.get("clarification_attribute")
+    attr_hint = ATTRIBUTE_HINTS.get(category, {}).get(attr, "") if attr else ""
 
     # Build action-specific instructions
     action_instructions = {
@@ -257,21 +349,21 @@ def response_generator_node(state: DialogueState) -> dict:
             "Mention the available categories: smartphones or headphones."
         ),
         "ask_clarification": (
-            f"You have {len(state['candidates'])} products matching the current filters. "
-            f"Ask ONE focused question to narrow this down. "
-            f"The best attribute to ask about next is: '{state['clarification_attribute']}'. "
-            "Make the question feel natural, not like a form. "
-            "Optionally mention 2-3 example values for that attribute."
+            f"Ask the user about ONE attribute: '{attr}'.\n"
+            f"Context to weave in (briefly): {attr_hint}\n"
+            "Phrase a single natural question — 2 to 3 sentences total. Briefly explain the trade-off using the context above, "
+            "but don't over-list options. Mention casually that the user can say 'any' or 'skip' to move on."
         ),
         "recommend": (
-            f"You have found {len(top_candidates)} product(s) that match perfectly. "
-            "Present them clearly: for each product, give the model name, price, and 3-4 key specs. "
-            "End with a brief friendly note (e.g. ask if they want more details or to search differently)."
+            "You've selected the top 2 products by an internal score. A comparison TABLE will be shown automatically below your reply, "
+            "so DO NOT list specs, prices, or scores in your text. "
+            "Write 1-2 sentences introducing the two picks (use brand + model only) and the single biggest reason each one stands out. "
+            "End with a friendly closing line offering to adjust the search."
         ),
         "no_results": (
-            "No products match the current filters. Apologize briefly. "
-            "Identify the most restrictive filter and suggest relaxing it. "
-            "Ask if they'd like to adjust their preferences."
+            "No products match the current preferences. Apologize briefly. "
+            "Identify the most restrictive preference and suggest relaxing it. "
+            "Ask if they'd like to adjust."
         ),
         "done": (
             "The user is satisfied. Wish them well and offer to help with another search."
@@ -284,18 +376,17 @@ Your task: {action_instructions}
 
 Current session context:
 - Category: {category}
-- Active filters: {filters_summary}
+- Active preferences: {filters_summary}
 - Turn number: {state['turn_count']}
 
-{"Products to present:" if top_candidates else ""}
+{"Selected products (for your awareness — DO NOT list specs in your reply):" if top_candidates else ""}
 {candidates_text}
 
 Rules:
-- Be concise (3-6 sentences max unless presenting products)
-- Never mention "filters", "database", "JSON", or technical internals
-- Sound like a real shop assistant, not a chatbot
-- Do not repeat the user's exact words back to them
-- If presenting products, use a clear format: **Brand Model** — €price — key specs
+- Be concise. For ask_clarification: 2-3 sentences. For recommend: 1-2 sentences plus a closing line.
+- Never mention "filters", "database", "JSON", "score", or technical internals.
+- Sound like a real shop assistant, not a chatbot.
+- Do not repeat the user's exact words back to them.
 
 Write the assistant reply only, no preamble."""
 

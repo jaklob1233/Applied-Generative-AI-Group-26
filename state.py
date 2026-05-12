@@ -14,6 +14,7 @@ class DialogueState(TypedDict):
     # ── Intent & extraction (refreshed every turn) ────────────────────────────
     intent: Optional[str]            # explore | specific | refine | done | chitchat
     extracted_filters: Dict[str, Any]  # filters extracted from THIS turn only
+    extracted_category: Optional[str]  # category mentioned in THIS turn (None if not mentioned)
 
     # ── Persistent dialogue state (accumulated across turns) ──────────────────
     category: Optional[str]          # smartphone | headphones | None
@@ -23,6 +24,8 @@ class DialogueState(TypedDict):
     action: Optional[str]            # ask_category | ask_clarification | recommend | no_results | done
     candidates: List[Dict[str, Any]] # products matching current filters (up to 10)
     clarification_attribute: Optional[str]  # which attribute to ask about next
+    last_asked_attribute: Optional[str]     # attribute asked in the PREVIOUS turn (for skip detection)
+    asked_skipped: List[str]                # attributes the user explicitly declined to filter on
 
     # ── Response ──────────────────────────────────────────────────────────────
     response: str                    # final assistant message shown to the user
@@ -36,11 +39,14 @@ def initial_state() -> DialogueState:
         user_input="",
         intent=None,
         extracted_filters={},
+        extracted_category=None,
         category=None,
         active_filters={},
         action=None,
         candidates=[],
         clarification_attribute=None,
+        last_asked_attribute=None,
+        asked_skipped=[],
         response="",
         turn_count=0,
     )

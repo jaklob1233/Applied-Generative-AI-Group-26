@@ -18,7 +18,7 @@ crs_project/
 ├── test_cli.py           # CLI test (no UI needed)
 │
 └── datasets/             # Product CSVs
-    ├── reduced_file_smartphone_500.csv   # 500 smartphones (price in INR)
+    ├── reduced_file_smartphone_500.csv   # 500 smartphones (price in USD)
     └── reduced_file_headphones_500.csv   # 500 headphones (price in USD)
 ```
 
@@ -81,18 +81,33 @@ Assistant reply
 ### Dialogue State
 The `DialogueState` TypedDict persists across turns and tracks:
 - `category`: smartphone | headphones
-- `active_filters`: merged structured preferences (e.g. `{price_max: 30000, brand_name: "samsung"}`)
+- `active_filters`: merged structured preferences (e.g. `{price_usd_max: 300, brand_name: "samsung"}`)
+- `asked_skipped`: attributes the user explicitly declined to filter on
+- `last_asked_attribute`: which attribute the assistant asked about last turn (for skip detection)
 - `candidates`: current matching products
 - `action`: what the system decided to do this turn
 - `messages`: full conversation history
 
+### Conversation Behavior
+
+- **Fixed question order.** Each category has a predefined sequence of clarification questions (see `QUESTION_ORDER` in [database.py](database.py)):
+  - Smartphones: `os → price_usd → battery_capacity → primary_camera_rear → ram_capacity → internal_memory`
+  - Headphones: `type → form_factor → noise_cancellation → price_usd`
+  The system asks them in order, skipping any the user has already answered.
+
+- **Skipping.** If the user says "any", "skip", "I don't care", etc., the attribute is added to `asked_skipped` and the system moves on instead of nagging.
+
+- **Category switching mid-conversation.** Saying "actually, show me headphones" while shopping for smartphones resets `active_filters` and `asked_skipped` automatically — no need to press the sidebar reset button.
+
+- **Recommendation.** Once all questions are answered/skipped (or candidates ≤ 2), the system scores all matching products on a weighted 0-100 scale and presents the **top 2** in a side-by-side comparison table. Ties are broken randomly. Weights live in `database.py` (`_SMARTPHONE_WEIGHTS` / `_HEADPHONES_WEIGHTS`).
+
 ### Supported Filter Keys
 
-**Smartphones** (price in INR):
+**Smartphones** (price in USD):
 
 | Key | Type | Example |
 |-----|------|---------|
-| `price_min` / `price_max` | int | 30000 |
+| `price_usd_min` / `price_usd_max` | int | 300 |
 | `brand_name` | str | "samsung" |
 | `os` | str | "android" / "ios" / "other" |
 | `ram_capacity` / `ram_capacity_min` | int | 8 |
@@ -140,7 +155,7 @@ The `DialogueState` TypedDict persists across turns and tracks:
 
 ## Extending the System
 
-- **Add a product category**: Add a CSV to `datasets/`, register it in `database.py:load_all()` (and add a column rename map if column names need normalising), extend the `ASKABLE` map, and add the new filter keys to `nodes.py`'s extraction prompt.
+- **Add a product category**: Add a CSV to `datasets/`, register it in `database.py:load_all()` (and add a column rename map if column names need normalising), extend `QUESTION_ORDER` with the desired clarification sequence, define a weight map for `top_n_by_score`, add per-attribute hints to `ATTRIBUTE_HINTS` in `nodes.py`, add the new filter keys to the extraction prompt, and add a renderer branch in `app.py:_render_comparison_table`.
 - **Add a new intent**: Add it to the intent list in `nodes.py` and handle it in `retrieve_and_act_node`.
 - **Add a new node**: Register it in `graph.py` and wire edges accordingly.
 - **LangSmith traces**: Every `graph.invoke()` call is automatically traced at https://smith.langchain.com/
