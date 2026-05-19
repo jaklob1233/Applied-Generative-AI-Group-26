@@ -95,11 +95,17 @@ The `DialogueState` TypedDict persists across turns and tracks:
   - Headphones: `type → form_factor → noise_cancellation → price_usd`
   The system asks them in order, skipping any the user has already answered.
 
-- **Skipping.** If the user says "any", "skip", "I don't care", etc., the attribute is added to `asked_skipped` and the system moves on instead of nagging.
+- **Skipping.** If the user says "any", "skip", "I don't care", etc. — or clicks the "Any" quick-reply button — the attribute is added to `asked_skipped` and the system moves on instead of nagging.
+
+- **Quick-reply buttons.** Below every clarification question, the UI shows clickable suggestion chips (e.g. *Android · iOS · Other · Any*) generated from `ATTRIBUTE_SUGGESTIONS` in `app.py`. Clicking sends the label through the LLM pipeline exactly like typed input.
 
 - **Category switching mid-conversation.** Saying "actually, show me headphones" while shopping for smartphones resets `active_filters` and `asked_skipped` automatically — no need to press the sidebar reset button.
 
-- **Recommendation.** Once all questions are answered/skipped (or candidates ≤ 2), the system scores all matching products on a weighted 0-100 scale and presents the **top 2** in a side-by-side comparison table. Ties are broken randomly. Weights live in `database.py` (`_SMARTPHONE_WEIGHTS` / `_HEADPHONES_WEIGHTS`).
+- **Chitchat handling.** Greetings ("good morning"), thanks, jokes, or other off-topic messages don't touch the product state; the assistant acknowledges warmly, reminds you of its scope, and (if a question was pending) gently re-asks it.
+
+- **Recommendation.** Once all questions are answered/skipped (or candidates ≤ 2), the system runs **TOPSIS** (Hwang & Yoon, 1981 — Technique for Order of Preference by Similarity to Ideal Solution) on every matching product and shows them all as a browsable list, sorted best-fit first. Closeness coefficient = distance to the ideal (top specs, lowest price) divided by total distance to ideal and worst, scaled to 0-100. Weights live in `database.py` (`_SMARTPHONE_WEIGHTS` / `_HEADPHONES_WEIGHTS`).
+
+- **Browse and compare.** The recommendation list is a list of expanders, top 3 auto-expanded. Each expander shows the product's spec sheet plus a **score breakdown** (per-attribute position vs the whole catalog, 0-100, weight). A checkbox inside each lets the user select 2-3 products; a live side-by-side comparison table renders as soon as 2+ items are checked.
 
 ### Supported Filter Keys
 

@@ -104,8 +104,12 @@ def _apply_filters(df: pd.DataFrame, filters: Dict[str, Any]) -> pd.DataFrame:
     return df
 
 
-def retrieve(category: str, filters: Dict[str, Any], limit: int = 10) -> List[Dict]:
-    """Return up to `limit` products matching the filters for a given category."""
+def retrieve(category: str, filters: Dict[str, Any], limit: Optional[int] = 10) -> List[Dict]:
+    """
+    Return products matching the filters for a given category.
+    Pass `limit=None` to get the full filtered set (used during recommendation
+    so the scorer sees the true population and the sidebar count is accurate).
+    """
     if category not in _dataframes:
         return []
     df = _dataframes[category].copy()
@@ -114,7 +118,9 @@ def retrieve(category: str, filters: Dict[str, Any], limit: int = 10) -> List[Di
     # one-time INR→USD conversion on 2026-05-12 (rate 1 INR = 0.010485 USD).
     if "price_usd" in df.columns:
         df = df.sort_values("price_usd")
-    return df.head(limit).to_dict("records")
+    if limit is not None:
+        df = df.head(limit)
+    return df.to_dict("records")
 
 
 # ── Dialogue: fixed question order per category ───────────────────────────────
@@ -200,7 +206,10 @@ def _is_nan(v: Any) -> bool:
 def _normalize_to_score(values: List[Any], mode: str) -> List[float]:
     """Map values to a 0-100 score using min-max within the candidate set."""
     if mode == "binary":
-        return [100.0 if str(v).lower() == "true" else 0.0 for v in values]
+        # Accept both string "True" (from CSV) and numeric 1.0 (from _value_for)
+        def _is_true(v):
+            return v is True or v == 1.0 or str(v).lower() == "true"
+        return [100.0 if _is_true(v) else 0.0 for v in values]
 
     nums: List[float] = []
     for v in values:
@@ -234,32 +243,168 @@ def _normalize_to_score(values: List[Any], mode: str) -> List[float]:
     return out
 
 
+def _value_for(category: str, candidate: Dict, attr: str, mode: str) -> Optional[float]:
+    """Extract a single numeric value for an attribute from a candidate (or None)."""
+    if attr == "freq_range":
+        lo, hi = candidate.get("freq_low_hz"), candidate.get("freq_high_hz")
+        if lo is None or hi is None or _is_nan(lo) or _is_nan(hi):
+            return None
+        return float(hi) - float(lo)
+    if mode == "binary":
+        return 1.0 if str(candidate.get(attr, "")).lower() == "true" else 0.0
+    v = candidate.get(attr)
+    if v is None or _is_nan(v):
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def score_candidates(category: str, candidates: List[Dict]) -> List[float]:
-    """Return a 0-100 weighted score per candidate (same order as input)."""
+    """
+    TOPSIS scoring (Hwang & Yoon, 1981) — Technique for Order of Preference by
+    Similarity to Ideal Solution. Returns 0-100 closeness coefficients.
+
+    Steps:
+      1. Build decision matrix (impute missing values with column median).
+      2. Vector-normalise each column (divide by its Euclidean norm).
+      3. Apply normalised attribute weights.
+      4. Determine positive ideal A* (best per attribute) and negative ideal A-.
+         For benefit attrs (higher better): A* = max, A- = min. For cost: reversed.
+      5. For each candidate, compute Euclidean distances d+ to A* and d- to A-.
+      6. Closeness coefficient C = d- / (d+ + d-), scaled to 0-100.
+    """
+    import math
+
     weights = _WEIGHTS_BY_CATEGORY.get(category)
     if not weights or not candidates:
         return [0.0] * len(candidates)
 
-    attr_scores: Dict[str, List[float]] = {}
-    for attr, (_, mode) in weights.items():
-        if attr == "freq_range":
-            values = [
-                (c.get("freq_high_hz") or 0) - (c.get("freq_low_hz") or 0)
-                for c in candidates
-            ]
-        else:
-            values = [c.get(attr) for c in candidates]
-        attr_scores[attr] = _normalize_to_score(values, mode)
+    n = len(candidates)
+    if n == 1:
+        return [100.0]  # only candidate is trivially both best and worst → return 100
 
+    attrs = list(weights.keys())
+    m = len(attrs)
+
+    # 1. Build decision matrix; impute missing with per-column median.
+    matrix = [[0.0] * m for _ in range(n)]
+    for j, attr in enumerate(attrs):
+        mode = weights[attr][1]
+        col = [_value_for(category, c, attr, mode) for c in candidates]
+        clean = [v for v in col if v is not None]
+        median = (sorted(clean)[len(clean) // 2] if clean else 0.0)
+        for i in range(n):
+            matrix[i][j] = col[i] if col[i] is not None else median
+
+    # 2. Vector-normalise each column.
+    for j in range(m):
+        norm = math.sqrt(sum(matrix[i][j] ** 2 for i in range(n)))
+        if norm > 0:
+            for i in range(n):
+                matrix[i][j] /= norm
+
+    # 3. Apply normalised weights.
     total_weight = sum(w for w, _ in weights.values())
-    final: List[float] = []
-    for i in range(len(candidates)):
-        s = sum(
-            attr_scores[a][i] * weights[a][0] / total_weight
-            for a in weights
-        )
-        final.append(s)
-    return final
+    w_arr = [weights[attrs[j]][0] / total_weight for j in range(m)]
+    for i in range(n):
+        for j in range(m):
+            matrix[i][j] *= w_arr[j]
+
+    # 4. Positive and negative ideals per attribute.
+    is_benefit = [weights[attrs[j]][1] != "lower" for j in range(m)]
+    ideal_pos = [
+        (max(matrix[i][j] for i in range(n)) if is_benefit[j]
+         else min(matrix[i][j] for i in range(n)))
+        for j in range(m)
+    ]
+    ideal_neg = [
+        (min(matrix[i][j] for i in range(n)) if is_benefit[j]
+         else max(matrix[i][j] for i in range(n)))
+        for j in range(m)
+    ]
+
+    # 5-6. Closeness coefficient per candidate.
+    scores: List[float] = []
+    for i in range(n):
+        d_pos = math.sqrt(sum((matrix[i][j] - ideal_pos[j]) ** 2 for j in range(m)))
+        d_neg = math.sqrt(sum((matrix[i][j] - ideal_neg[j]) ** 2 for j in range(m)))
+        denom = d_pos + d_neg
+        scores.append((d_neg / denom * 100) if denom > 0 else 50.0)
+    return scores
+
+
+def score_breakdown(category: str, candidates: List[Dict]) -> List[List[Dict]]:
+    """
+    Per-product, per-attribute breakdown for the transparency UI.
+
+    Returns a list (one per candidate, same order as input) of lists of dicts:
+        {
+            "attr":        attribute name,
+            "raw":         raw value (may be None for missing),
+            "norm_0_100":  direction-aware position vs the WHOLE category (not the
+                           filtered set) — 100 = best in the entire catalog on
+                           this attribute, 0 = worst, 50 = median or missing.
+            "weight_pct":  percent weight (0-100, sums to 100 across attributes),
+            "direction":   "higher" | "lower" | "binary",
+        }
+
+    Normalising against the whole category (rather than the filtered candidates)
+    keeps the breakdown meaningful even when only 1-2 items match the filter —
+    otherwise every attribute would collapse to a self-referential 50.
+
+    The TOPSIS score in `score_candidates` still operates on the filtered set
+    (that's the right "best of my matches" ranking question).
+    """
+    weights = _WEIGHTS_BY_CATEGORY.get(category)
+    if not weights or not candidates:
+        return [[] for _ in candidates]
+
+    # Reference distribution = the full category dataframe (independent of filters)
+    full_df = _dataframes.get(category)
+    full_records = full_df.to_dict("records") if full_df is not None else candidates
+
+    attrs = list(weights.keys())
+    total_weight = sum(w for w, _ in weights.values())
+
+    # Per-attribute min/max across the WHOLE category
+    per_attr_minmax: Dict[str, tuple] = {}
+    for attr in attrs:
+        mode = weights[attr][1]
+        vals = [_value_for(category, c, attr, mode) for c in full_records]
+        clean = [v for v in vals if v is not None]
+        per_attr_minmax[attr] = (min(clean), max(clean)) if clean else (0.0, 0.0)
+
+    def _market_norm(raw, attr, mode):
+        if raw is None:
+            return 50.0
+        if mode == "binary":
+            return 100.0 if (raw is True or raw == 1.0 or str(raw).lower() == "true") else 0.0
+        vmin, vmax = per_attr_minmax[attr]
+        if vmax == vmin:
+            return 50.0
+        if mode == "higher":
+            x = 100.0 * (raw - vmin) / (vmax - vmin)
+        else:  # "lower"
+            x = 100.0 * (vmax - raw) / (vmax - vmin)
+        return max(0.0, min(100.0, x))
+
+    breakdowns: List[List[Dict]] = []
+    for c in candidates:
+        rows = []
+        for attr in attrs:
+            w, mode = weights[attr]
+            raw = _value_for(category, c, attr, mode)
+            rows.append({
+                "attr": attr,
+                "raw": raw,
+                "norm_0_100": round(_market_norm(raw, attr, mode), 1),
+                "weight_pct": round(100 * w / total_weight, 1),
+                "direction": mode,
+            })
+        breakdowns.append(rows)
+    return breakdowns
 
 
 def top_n_by_score(category: str, candidates: List[Dict], n: int = 2) -> List[Dict]:

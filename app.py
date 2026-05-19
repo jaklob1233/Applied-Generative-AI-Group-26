@@ -202,6 +202,167 @@ def _render_comparison_table(products, category):
     df = pd.DataFrame(data, index=[label for label, _ in rows])
     st.table(df)
 
+
+def _product_header(p, category):
+    """One-line summary used as the expander title for a single product."""
+    score = p.get("_score", "—")
+    if category == "smartphone":
+        brand = str(p.get("brand_name", "")).title()
+        model = p.get("model", "")
+        price = p.get("price_usd")
+        price_str = f"${int(price):,}" if isinstance(price, (int, float)) and price == price else "—"
+    elif category == "headphones":
+        brand = p.get("brand", "")
+        model = p.get("model", "")
+        price = p.get("price_usd")
+        price_str = f"${int(price)}" if isinstance(price, (int, float)) and price == price else "—"
+    else:
+        brand, model, price_str = "", "", "—"
+    return f"{brand} {model}  ·  {price_str}  ·  ⭐ {score} / 100".strip()
+
+
+_SCORE_ATTR_LABELS = {
+    "price_usd":           "💰 Price",
+    "primary_camera_rear": "📸 Rear Camera",
+    "battery_capacity":    "🔋 Battery",
+    "ram_capacity":        "🧠 RAM",
+    "internal_memory":     "💾 Storage",
+    "rating":              "⭐ Rating",
+    "avg_rating":          "⭐ Avg Rating",
+    "battery_hrs":         "🔋 Battery Life",
+    "freq_range":          "🎵 Freq Range",
+    "noise_cancellation":  "🔇 Noise Cancel.",
+}
+
+
+def _format_breakdown_value(attr, raw, direction):
+    """Pretty-print a raw value with the right unit for the breakdown table."""
+    if raw is None:
+        return "—"
+    if direction == "binary":
+        return "Yes" if raw == 1.0 else "No"
+    if attr == "price_usd":
+        return f"${int(raw):,}"
+    if attr in ("battery_capacity",):
+        return f"{int(raw)} mAh"
+    if attr in ("ram_capacity", "internal_memory"):
+        return f"{int(raw)} GB"
+    if attr == "primary_camera_rear":
+        return f"{int(raw)} MP"
+    if attr == "battery_hrs":
+        return f"{raw} hrs"
+    if attr == "freq_range":
+        return f"{int(raw)} Hz"
+    if attr in ("rating", "avg_rating"):
+        return f"{raw}"
+    return str(raw)
+
+
+def _render_score_breakdown(rows, total_count):
+    """Render a per-attribute breakdown markdown table for one product."""
+    if not rows:
+        return
+    md = ["| Factor | Value | Score (0-100) | Weight |", "|---|---|---|---|"]
+    for r in rows:
+        label = _SCORE_ATTR_LABELS.get(r["attr"], r["attr"])
+        value = _format_breakdown_value(r["attr"], r["raw"], r["direction"])
+        norm = r["norm_0_100"]
+        marker = "🟢" if norm >= 75 else "🟡" if norm >= 40 else "🔴"
+        md.append(f"| {label} | {value} | {marker} {norm:.0f} | {r['weight_pct']:.0f}% |")
+    st.markdown("\n".join(md))
+    st.caption(
+        f"_Top score uses **TOPSIS** — closeness to the ideal (best specs, lowest price) "
+        f"across the {total_count} matches. The Score column here shows where this product "
+        f"stands in the **whole catalog** for each attribute (100 = best in the catalog, "
+        f"0 = worst, 50 = median or missing)._"
+    )
+
+
+def _render_recommendation_list(products, category, msg_index):
+    """
+    Browse-and-compare view: every matching product as an expandable row,
+    with a 'compare' checkbox inside each. A live side-by-side comparison
+    table appears below when 2-3 items are checked.
+    """
+    if not products:
+        return
+
+    st.caption(
+        f"**{len(products)} matching {category}** — ranked by **TOPSIS** "
+        "(closeness to the ideal mix of high specs and low price). "
+        "Expand any item to see its score breakdown."
+    )
+
+    # Compute the per-product breakdown ONCE — it depends on the full candidate set.
+    breakdowns = database.score_breakdown(category, products)
+
+    selected_indices = []
+    for idx, p in enumerate(products):
+        with st.expander(_product_header(p, category), expanded=(idx < 3)):
+            # Compare checkbox at top — visible without scrolling specs
+            chk_key = f"cmp_chk_{msg_index}_{idx}"
+            if st.checkbox(
+                "📊 Add to comparison",
+                key=chk_key,
+                help="Select 2-3 items to see a side-by-side comparison below.",
+            ):
+                selected_indices.append(idx)
+            # Single-product spec table (reuses the comparison renderer)
+            _render_comparison_table([p], category)
+            # Score breakdown — shows exactly what drove this product's score
+            st.markdown("**📊 Why this score?**")
+            _render_score_breakdown(breakdowns[idx], total_count=len(products))
+
+    # Live comparison area
+    if len(selected_indices) >= 2:
+        st.divider()
+        # Take up to 3 if user checked more
+        compare_indices = selected_indices[:3]
+        if len(selected_indices) > 3:
+            st.info(
+                f"Comparing the first 3 of {len(selected_indices)} selected items. "
+                "Uncheck some to compare a different combination."
+            )
+        st.caption(f"**Comparing {len(compare_indices)} items:**")
+        _render_comparison_table([products[i] for i in compare_indices], category)
+    elif len(selected_indices) == 1:
+        st.caption("_Select 1-2 more items to compare._")
+
+
+# ── Quick-reply suggestions for clarification questions ─────────────────────
+
+# Each label is sent back through the LLM pipeline as if the user typed it.
+# "Any" triggers the existing skip-detection in state_updater_node.
+ATTRIBUTE_SUGGESTIONS = {
+    "smartphone": {
+        "os":                  ["Android", "iOS", "Other", "Any"],
+        "price_usd":           ["Under $200", "$200-500", "$500-1000", "$1000+", "Any"],
+        "battery_capacity":    ["3000+ mAh", "4000+ mAh", "5000+ mAh", "Any"],
+        "primary_camera_rear": ["12+ MP", "48+ MP", "64+ MP", "100+ MP", "Any"],
+        "ram_capacity":        ["4 GB", "6 GB", "8 GB", "12 GB+", "Any"],
+        "internal_memory":     ["64 GB", "128 GB", "256 GB", "512 GB+", "Any"],
+    },
+    "headphones": {
+        "type":                ["Wired", "Wireless", "Any"],
+        "form_factor":         ["Over-Ear", "On-Ear", "In-Ear", "Any"],
+        "noise_cancellation":  ["Yes", "No", "Any"],
+        "price_usd":           ["Under $100", "$100-300", "$300+", "Any"],
+    },
+}
+
+
+def _render_suggestion_buttons(category, attribute, msg_index):
+    """Render a row of quick-reply buttons; return the clicked label or None."""
+    options = ATTRIBUTE_SUGGESTIONS.get(category, {}).get(attribute)
+    if not options:
+        return None
+    cols = st.columns(len(options))
+    for i, opt in enumerate(options):
+        if cols[i].button(opt, key=f"sugg_{msg_index}_{attribute}_{i}", use_container_width=True):
+            return opt
+    return None
+
+
 # ── Main chat area ────────────────────────────────────────────────────────────
 
 col1, col2 = st.columns([3, 1])
@@ -219,44 +380,68 @@ if st.session_state.show_welcome:
         )
     st.session_state.show_welcome = False
 
-# Render chat history (including any saved comparison tables)
-for msg in st.session_state.chat_messages:
+# Render chat history (with browsable recommendation lists and quick-reply buttons)
+_last_idx = len(st.session_state.chat_messages) - 1
+for i, msg in enumerate(st.session_state.chat_messages):
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
-        if msg.get("table_products"):
+        # Recommendation list — kept per-message so past recommendations
+        # stay browsable; each message has its own checkbox state via msg_index.
+        if msg.get("recommend_products"):
             st.divider()
-            st.caption("**Comparison:**")
-            _render_comparison_table(msg["table_products"], msg["table_category"])
+            _render_recommendation_list(
+                msg["recommend_products"],
+                msg["recommend_category"],
+                i,
+            )
+        # Quick-reply buttons: only on the most recent assistant message that's
+        # awaiting an answer to a clarification question.
+        if (
+            i == _last_idx
+            and msg["role"] == "assistant"
+            and msg.get("clarification_attribute")
+        ):
+            clicked = _render_suggestion_buttons(
+                msg.get("clarification_category"),
+                msg["clarification_attribute"],
+                i,
+            )
+            if clicked:
+                st.session_state.queued_input = clicked
+                st.rerun()
 
 # ── Chat input ────────────────────────────────────────────────────────────────
 
-if user_input := st.chat_input("Tell me what you're looking for..."):
+# Accept either typed input or a queued quick-reply button click.
+typed_input = st.chat_input("Tell me what you're looking for...")
+queued_input = st.session_state.pop("queued_input", None)
+user_input = typed_input or queued_input
+
+if user_input:
     # Display user message immediately
     with st.chat_message("user"):
         st.markdown(user_input)
     st.session_state.chat_messages.append({"role": "user", "content": user_input})
 
-    # Run the LangGraph pipeline
+    # Run the LangGraph pipeline. The interactive recommendation list and the
+    # quick-reply buttons are intentionally NOT rendered inline — they have
+    # widget keys that would collide if rendered twice. The rerun + history
+    # loop below renders them once per pass.
     with st.chat_message("assistant"):
         with st.spinner("Thinking..."):
             new_state = run_turn(st.session_state.dialogue_state, user_input)
             st.session_state.dialogue_state = new_state
-
         response = new_state["response"]
         st.markdown(response)
 
-        # If we just recommended, render the comparison table beneath the reply
-        is_recommend = new_state["action"] == "recommend" and new_state["candidates"]
-        if is_recommend:
-            st.divider()
-            st.caption("**Comparison:**")
-            _render_comparison_table(new_state["candidates"][:2], new_state["category"])
-
-    # Persist the assistant turn; include the comparison products so the table
-    # re-renders on subsequent reruns from chat history.
+    # Persist the assistant turn. Save the ranked recommendation list (for
+    # recommend turns) or the clarification metadata (for question turns).
     chat_entry = {"role": "assistant", "content": response}
-    if is_recommend:
-        chat_entry["table_products"] = new_state["candidates"][:2]
-        chat_entry["table_category"] = new_state["category"]
+    if new_state["action"] == "recommend" and new_state["candidates"]:
+        chat_entry["recommend_products"] = new_state["candidates"]
+        chat_entry["recommend_category"] = new_state["category"]
+    elif new_state["action"] == "ask_clarification" and new_state.get("clarification_attribute"):
+        chat_entry["clarification_attribute"] = new_state["clarification_attribute"]
+        chat_entry["clarification_category"] = new_state["category"]
     st.session_state.chat_messages.append(chat_entry)
     st.rerun()

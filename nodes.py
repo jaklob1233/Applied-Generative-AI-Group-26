@@ -150,7 +150,7 @@ Intent definitions:
 - specific: user wants a very specific product (exact model, brand+spec combo)
 - refine: user is critiquing or narrowing previous results
 - done: user is satisfied / wants to stop
-- chitchat: unrelated to product search
+- chitchat: greetings ("hi", "good morning"), thanks, jokes, questions about you, or anything else NOT about finding a product. When intent is chitchat, extracted_filters MUST be empty and category MUST be null (do not invent values).
 
 CATEGORY SWITCHING:
 If the user pivots to a DIFFERENT product category mid-conversation (e.g. they
@@ -203,6 +203,12 @@ def state_updater_node(state: DialogueState) -> dict:
     current_category = state["category"]
     intent = state["intent"]
     last_asked = state.get("last_asked_attribute")
+
+    # 0. Chitchat short-circuit. Don't touch product state at all — even if the
+    #    LLM hallucinated a category or a filter from a greeting like "good
+    #    morning", we ignore it. Just advance the turn counter.
+    if intent == "chitchat":
+        return {"turn_count": state["turn_count"] + 1}
 
     # 1. Category switch → wipe filters + skipped list, keep only THIS turn's filters
     if (
@@ -274,8 +280,15 @@ def retrieve_and_act_node(state: DialogueState) -> dict:
             "last_asked_attribute": None,
         }
 
-    # Pull a generous candidate pool so the scorer has a real population
-    candidates = database.retrieve(state["category"], state["active_filters"], limit=50)
+    # Off-topic / small-talk — respond warmly and remind scope.
+    # Preserve candidates / clarification_attribute / last_asked_attribute so the
+    # response can gently reprompt any pending question (we only override action).
+    if state["intent"] == "chitchat":
+        return {"action": "chitchat"}
+
+    # Pull the FULL filtered set — both so the sidebar count reflects reality,
+    # and so the scorer ranks across all matches (not just the cheapest 50).
+    candidates = database.retrieve(state["category"], state["active_filters"], limit=None)
 
     if len(candidates) == 0:
         return {
@@ -292,12 +305,15 @@ def retrieve_and_act_node(state: DialogueState) -> dict:
     )
 
     # Recommend when either we've already narrowed enough OR there are no more
-    # questions to ask. Always present the top 2 by weighted score.
+    # questions to ask. Return ALL candidates ranked by score (best first) so
+    # the user can browse and pick items to compare.
     if len(candidates) <= 2 or next_q is None:
-        top = database.top_n_by_score(state["category"], candidates, n=2)
+        ranked = database.top_n_by_score(
+            state["category"], candidates, n=len(candidates)
+        )
         return {
             "action": "recommend",
-            "candidates": top,
+            "candidates": ranked,
             "clarification_attribute": None,
             "last_asked_attribute": None,
         }
@@ -328,8 +344,10 @@ def response_generator_node(state: DialogueState) -> dict:
     category_label = CATEGORY_LABEL.get(category, category)
     filters_summary = json.dumps(state["active_filters"], indent=2) if state["active_filters"] else "none"
 
-    # Format top candidates for the prompt (recommend action picks 2)
+    # For the LLM prompt, only show the top 2 (it doesn't need to know about
+    # all 50). The full ranked list is in state["candidates"] for the UI.
     top_candidates = state["candidates"][:2]
+    total_matches = len(state["candidates"])
     candidates_text = ""
     if top_candidates:
         lines = []
@@ -341,6 +359,14 @@ def response_generator_node(state: DialogueState) -> dict:
     # Look up the explanation for the attribute we're about to ask about
     attr = state.get("clarification_attribute")
     attr_hint = ATTRIBUTE_HINTS.get(category, {}).get(attr, "") if attr else ""
+
+    # For chitchat: optionally reference the pending clarification question
+    pending_q = state.get("last_asked_attribute")
+    chitchat_reprompt = (
+        f" They were in the middle of choosing — you'd just asked about '{pending_q}'. Gently invite them back to that question."
+        if pending_q else
+        " Invite them to tell you what they're looking for."
+    )
 
     # Build action-specific instructions
     action_instructions = {
@@ -355,10 +381,11 @@ def response_generator_node(state: DialogueState) -> dict:
             "but don't over-list options. Mention casually that the user can say 'any' or 'skip' to move on."
         ),
         "recommend": (
-            "You've selected the top 2 products by an internal score. A comparison TABLE will be shown automatically below your reply, "
-            "so DO NOT list specs, prices, or scores in your text. "
-            "Write 1-2 sentences introducing the two picks (use brand + model only) and the single biggest reason each one stands out. "
-            "End with a friendly closing line offering to adjust the search."
+            f"You found {total_matches} matching {category_label}, sorted by an internal match score (best first). "
+            "A browsable list will appear below your reply — each item expands to show full specs, and the user can check 2-3 boxes to see a side-by-side comparison automatically. "
+            "DO NOT list specs, prices, or scores in your text. "
+            f"Write 1-2 sentences acknowledging the {total_matches} options, optionally name the very top pick (brand + model only) as a starting suggestion, and invite the user to browse the list and pick items to compare. "
+            "End with a friendly note offering to refine the search if needed."
         ),
         "no_results": (
             "No products match the current preferences. Apologize briefly. "
@@ -367,6 +394,13 @@ def response_generator_node(state: DialogueState) -> dict:
         ),
         "done": (
             "The user is satisfied. Wish them well and offer to help with another search."
+        ),
+        "chitchat": (
+            "The user said something off-topic — a greeting, thanks, or small talk. "
+            "Reply warmly in ONE short sentence acknowledging what they said. "
+            "Then in ONE sentence politely remind them that you're here to help find a smartphone or a pair of headphones."
+            + chitchat_reprompt
+            + " Keep the whole reply to 2-3 sentences. Do NOT pretend to have product results — there are none to present."
         ),
     }.get(action, "Respond helpfully to the user.")
 
