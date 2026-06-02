@@ -17,9 +17,12 @@ crs_project/
 ├── app.py                # Streamlit chat UI  ← main entry point
 ├── test_cli.py           # CLI test (no UI needed)
 │
-└── datasets/             # Product CSVs
-    ├── reduced_file_smartphone_500.csv   # 500 smartphones (price in USD)
-    └── reduced_file_headphones_500.csv   # 500 headphones (price in USD)
+├── datasets/             # Product CSVs
+│   ├── reduced_file_smartphone_500.csv   # 500 smartphones (price in USD)
+│   └── reduced_file_headphones_500.csv   # 500 headphones (price in USD)
+│
+└── eval/                 # Evaluation suite
+    └── intent_eval.py    # Intent classification accuracy (41 labelled cases)
 ```
 
 ## Setup
@@ -211,6 +214,45 @@ At minimum:
 5. **Dataset-derived percentile thresholds** — needed to translate vague qualitative terms ("cheap", "premium") into concrete filter bounds.
 
 Everything else (which questions to ask in what order, when to recommend vs ask, how to present results) is downstream of these.
+
+---
+
+## Evaluation
+
+The `eval/` directory contains automated evaluation scripts that measure system quality against hand-labelled golden datasets.
+
+### Intent Classification (`eval/intent_eval.py`)
+
+Runs 41 labelled utterances through `intent_and_extract_node` and reports per-class accuracy and a confusion matrix. Cases cover all five intents (`explore`, `specific`, `refine`, `done`, `chitchat`) across cold-start and mid-session contexts, including edge cases such as negation, skip signals, and multi-attribute refinements.
+
+```bash
+# Text report (failures only)
+python eval/intent_eval.py
+
+# Text report + save PNG chart to eval/intent_eval.png
+python eval/intent_eval.py --plot
+
+# Show every case, not just failures
+python eval/intent_eval.py --verbose
+
+# Custom pass threshold (default 80%)
+python eval/intent_eval.py --threshold 85
+```
+
+Exits with code 0 if accuracy ≥ threshold, 1 otherwise — suitable for CI.
+
+**Baseline results** (GPT-4o-mini via OpenRouter):
+
+| Intent | Correct | Total | Accuracy |
+|--------|---------|-------|----------|
+| explore | 8 | 10 | 80% |
+| specific | 7 | 7 | 100% |
+| refine | 11 | 11 | 100% |
+| done | 5 | 5 | 100% |
+| chitchat | 8 | 8 | 100% |
+| **overall** | **39** | **41** | **95.1%** |
+
+The two `explore` misclassifications are borderline cases where the user's utterance contains concrete attributes (OS, price range) that the model interprets as `specific`. They highlight a genuine boundary ambiguity in the intent definitions rather than a clear model error.
 
 ---
 
