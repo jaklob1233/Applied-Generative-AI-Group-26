@@ -20,8 +20,24 @@ from collections import defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from state import initial_state
+import nodes
 from nodes import intent_and_extract_node
+
+# Cap max_tokens for eval runs — extraction responses are small JSON objects.
+# Without this, OpenRouter pre-reserves 16 384 tokens per call which exhausts
+# the key's credit limit even though the actual output is ~100 tokens.
+from langchain_openai import ChatOpenAI
+nodes.llm = ChatOpenAI(
+    model=os.getenv("OPENROUTER_MODEL", "openai/gpt-4o-mini"),
+    openai_api_key=os.getenv("OPENROUTER_API_KEY"),
+    openai_api_base="https://openrouter.ai/api/v1",
+    temperature=0,
+    max_tokens=512,
+)
 
 # ── Golden dataset ─────────────────────────────────────────────────────────────
 # Fields:
