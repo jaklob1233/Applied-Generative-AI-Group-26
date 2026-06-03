@@ -287,17 +287,39 @@ def _render_recommendation_list(products, category, msg_index):
     if not products:
         return
 
+    total_matches = len(products)
     st.caption(
-        f"**{len(products)} matching {category}** — ranked by **TOPSIS** "
+        f"**{total_matches} matching {category}** — ranked by **TOPSIS** "
         "(closeness to the ideal mix of high specs and low price). "
         "Expand any item to see its score breakdown."
     )
 
-    # Compute the per-product breakdown ONCE — it depends on the full candidate set.
+    # Top-N selector: lets the user trim the list to the strongest few picks.
+    # "All" preserves the full ranked browse. Defaults to a manageable cap
+    # when the result set is large — keeps the page snappy (rendering 100+
+    # expanders triggers a noticeable lag in Streamlit on every click).
+    options = [n for n in (3, 5, 10, 20) if n < total_matches] + ["All"]
+    default_label = "All" if total_matches <= 10 else 10
+    if default_label not in options:
+        default_label = options[0]
+    selected_label = st.selectbox(
+        "Show top",
+        options,
+        index=options.index(default_label),
+        key=f"topn_{msg_index}",
+        help="Limit the list to the strongest N picks; choose 'All' to see every match.",
+    )
+    if selected_label == "All":
+        display_products = products
+    else:
+        display_products = products[: int(selected_label)]
+
+    # Compute the per-product breakdown ONCE for the FULL set so the per-attribute
+    # market-positioning scores are stable regardless of the display cap.
     breakdowns = database.score_breakdown(category, products)
 
     selected_indices = []
-    for idx, p in enumerate(products):
+    for idx, p in enumerate(display_products):
         with st.expander(_product_header(p, category), expanded=(idx < 3)):
             # Compare checkbox at top — visible without scrolling specs
             chk_key = f"cmp_chk_{msg_index}_{idx}"
@@ -418,6 +440,13 @@ queued_input = st.session_state.pop("queued_input", None)
 user_input = typed_input or queued_input
 
 if user_input:
+    # If the previous turn ended with action="done" (user said thanks / start
+    # over / etc.), wipe the conversation and product state BEFORE processing
+    # the new message — so this input starts a completely fresh session.
+    if st.session_state.pop("pending_reset", False):
+        st.session_state.dialogue_state = initial_state()
+        st.session_state.chat_messages = []
+        st.session_state.show_welcome = False  # the new input is taking welcome's place
     # Display user message immediately
     with st.chat_message("user"):
         st.markdown(user_input)
@@ -444,4 +473,10 @@ if user_input:
         chat_entry["clarification_attribute"] = new_state["clarification_attribute"]
         chat_entry["clarification_category"] = new_state["category"]
     st.session_state.chat_messages.append(chat_entry)
+
+    # If the user signaled they're done / want to start over, queue a full
+    # reset that will fire on their next message (see top of input handler).
+    if new_state["action"] == "done":
+        st.session_state.pending_reset = True
+
     st.rerun()

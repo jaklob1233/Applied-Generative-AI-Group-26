@@ -154,6 +154,85 @@ def base_attr(filter_key: str) -> str:
     return filter_key
 
 
+# ── Vague-term grounding: dataset percentiles per scoreable attribute ────────
+#
+# Used by the intent-extraction prompt so the LLM can translate terms like
+# "cheap", "premium", "big battery", "good camera" into concrete filter
+# thresholds derived from the actual dataset distribution.
+
+_VAGUE_GROUND_ATTRS: Dict[str, List[str]] = {
+    "smartphone": [
+        "price_usd", "battery_capacity", "primary_camera_rear",
+        "ram_capacity", "internal_memory", "rating",
+    ],
+    "headphones": [
+        "price_usd", "avg_rating", "battery_hrs",
+    ],
+}
+
+_VAGUE_THRESHOLDS_CACHE: Dict[str, Dict[str, Dict[str, float]]] = {}
+
+
+def candidate_stats(category: str, candidates: List[Dict]) -> Dict[str, Dict[str, float]]:
+    """
+    For a given (already-filtered) candidate set, compute min/median/max
+    of each scoreable numeric attribute. Used to anchor RELATIVE critiques
+    ('cheaper', 'bigger battery', 'better camera') against what the user
+    has just been shown — so 'cheaper' means 'less than the current min'.
+    """
+    attrs = _VAGUE_GROUND_ATTRS.get(category, [])
+    if not candidates or not attrs:
+        return {}
+    out: Dict[str, Dict[str, float]] = {}
+    for attr in attrs:
+        vals: List[float] = []
+        for c in candidates:
+            v = c.get(attr)
+            if v is None or _is_nan(v):
+                continue
+            try:
+                vals.append(float(v))
+            except (TypeError, ValueError):
+                continue
+        if not vals:
+            continue
+        vals.sort()
+        n = len(vals)
+        median = vals[n // 2] if n % 2 == 1 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+        out[attr] = {"min": vals[0], "median": median, "max": vals[-1]}
+    return out
+
+
+def vague_term_thresholds(category: str) -> Dict[str, Dict[str, float]]:
+    """
+    Returns {attribute: {"p25": v, "p50": v, "p75": v}} computed once per
+    category and cached. Numeric columns only; NaNs are ignored.
+    """
+    if category in _VAGUE_THRESHOLDS_CACHE:
+        return _VAGUE_THRESHOLDS_CACHE[category]
+
+    attrs = _VAGUE_GROUND_ATTRS.get(category, [])
+    df = _dataframes.get(category)
+    out: Dict[str, Dict[str, float]] = {}
+    if df is None:
+        _VAGUE_THRESHOLDS_CACHE[category] = out
+        return out
+
+    for attr in attrs:
+        if attr not in df.columns:
+            continue
+        col = pd.to_numeric(df[attr], errors="coerce").dropna()
+        if len(col) == 0:
+            continue
+        out[attr] = {
+            "p25": float(col.quantile(0.25)),
+            "p50": float(col.quantile(0.50)),
+            "p75": float(col.quantile(0.75)),
+        }
+    _VAGUE_THRESHOLDS_CACHE[category] = out
+    return out
+
+
 def next_question(
     category: str,
     filters: Dict[str, Any],

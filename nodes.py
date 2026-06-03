@@ -67,6 +67,44 @@ def _recent_history(state: DialogueState, n: int = 6) -> str:
     return "\n".join(lines) or "(start of conversation)"
 
 
+# ── Vague-term hint block (injected into the intent extraction prompt) ───────
+
+def _vague_terms_block() -> str:
+    """
+    Build a compact percentile reference + mapping rules so the LLM can
+    translate terms like 'cheap', 'premium', 'big battery', 'good camera'
+    into concrete filter thresholds grounded in the actual dataset.
+    """
+    rows = []
+    for category in database.get_categories():
+        thresholds = database.vague_term_thresholds(category)
+        if not thresholds:
+            continue
+        bits = []
+        for attr, p in thresholds.items():
+            if attr.startswith("price"):
+                bits.append(f"{attr}=${p['p25']:.0f}/${p['p50']:.0f}/${p['p75']:.0f}")
+            elif attr in ("avg_rating",):
+                bits.append(f"{attr}={p['p25']:.1f}/{p['p50']:.1f}/{p['p75']:.1f}")
+            else:
+                bits.append(f"{attr}={p['p25']:.0f}/{p['p50']:.0f}/{p['p75']:.0f}")
+        rows.append(f"  [{category}] " + ", ".join(bits))
+    if not rows:
+        return ""
+    percentile_lines = "\n".join(rows)
+    return (
+        "VAGUE TERMS — translate to concrete filter thresholds grounded in these dataset percentiles (p25/median/p75):\n"
+        f"{percentile_lines}\n"
+        "Mapping rules:\n"
+        "  - 'cheap' / 'budget' / 'affordable' → <price>_max = p25 of that category\n"
+        "  - 'premium' / 'high-end' / 'expensive' / 'flagship' → <price>_min = p75\n"
+        "  - 'mid-range' / 'moderate' → <price>_min = p25 AND <price>_max = p75\n"
+        "  - Quality superlatives ('good camera', 'big battery', 'lots of RAM', 'highly rated', 'long battery life') → corresponding <attribute>_min = p75\n"
+        "  - Negative qualifiers ('small battery', 'low rated', 'weak') → corresponding <attribute>_max = p25\n"
+        "  - Always use the actual numbers above; do NOT invent thresholds."
+    )
+
+
 # ── Per-attribute explanations (woven into clarification questions) ──────────
 
 ATTRIBUTE_HINTS: Dict[str, Dict[str, str]] = {
@@ -98,6 +136,38 @@ def intent_and_extract_node(state: DialogueState) -> dict:
     history = _recent_history(state)
     active = json.dumps(state["active_filters"], indent=2)
     last_asked = state.get("last_asked_attribute") or "nothing in particular"
+    vague_block = _vague_terms_block()
+
+    # Relative-critique anchor: if the LAST turn ended in a recommendation,
+    # tell the LLM the min/median/max of those products so terms like
+    # "cheaper" / "bigger battery" / "better camera" can be grounded in
+    # what the user actually just saw.
+    prev_stats = state.get("last_recommend_stats")
+    if prev_stats:
+        stat_lines = []
+        for attr, s in prev_stats.items():
+            prefix = "$" if attr.startswith("price") else ""
+            stat_lines.append(
+                f"  {attr}: min={prefix}{s['min']:.0f}, median={prefix}{s['median']:.0f}, max={prefix}{s['max']:.0f}"
+            )
+        critique_block = (
+            "PREVIOUS RECOMMENDATIONS — these products were just shown to the user:\n"
+            + "\n".join(stat_lines)
+            + "\nWhen the user uses RELATIVE terms (refine intent), anchor against these:\n"
+            "  - 'cheaper' / 'less expensive' → <price>_max = previous min (strictly cheaper than anything shown)\n"
+            "  - 'more expensive' / 'pricier' → <price>_min = previous max\n"
+            "  - 'bigger battery' / 'longer battery' → <battery>_min = previous max\n"
+            "  - 'smaller' / 'lower X' → corresponding <X>_max = previous min\n"
+            "  - 'better camera' / 'better X' → <X>_min = previous max\n\n"
+            "CRITICAL FOR REFINE INTENT: ONLY return the NEW filter(s) the user is adding. "
+            "DO NOT include the existing filters in extracted_filters — they are already in "
+            "active_filters and will be preserved by the state updater. NEVER set an existing "
+            "filter to null (that removes it!) unless the user explicitly says 'forget about X', "
+            "'change X', 'I don't care about X anymore'. By default, refine = ADD a constraint, "
+            "not replace the whole filter set."
+        )
+    else:
+        critique_block = ""
 
     prompt = f"""You are a preference extractor for a conversational product recommender.
 
@@ -106,7 +176,7 @@ Available product categories: smartphone, headphones.
 Analyze the user's LATEST message and return a JSON object with EXACTLY these fields:
 
 {{
-  "intent": "<one of: explore | specific | refine | done | chitchat>",
+  "intent": "<one of: explore | specific | refine | summarize | done | chitchat>",
   "category": "<one of: smartphone | headphones | null>",
   "extracted_filters": {{
     // Structured filters extracted from THIS message only.
@@ -145,12 +215,41 @@ Analyze the user's LATEST message and return a JSON object with EXACTLY these fi
   }}
 }}
 
-Intent definitions:
-- explore: user wants to browse or get recommendations in a general direction
-- specific: user wants a very specific product (exact model, brand+spec combo)
-- refine: user is critiquing or narrowing previous results
-- done: user is satisfied / wants to stop
-- chitchat: greetings ("hi", "good morning"), thanks, jokes, questions about you, or anything else NOT about finding a product. When intent is chitchat, extracted_filters MUST be empty and category MUST be null (do not invent values).
+Intent definitions — choose carefully, this drives system behavior:
+
+- specific: user has clear criteria identifying a product or a small set (examples:
+  "I want a Samsung Galaxy S22", "show me the cheapest Apple phone", "an Android
+  phone with at least 8 GB RAM and 5000 mAh battery", "wireless over-ear with noise
+  cancellation under $200"). Trigger when the user gives one or more concrete
+  filters/specifications. The system will recommend immediately rather than asking
+  follow-up questions.
+
+- explore: user is in the early stages with NO concrete criteria yet
+  (examples: "I want a phone", "recommend me headphones", "help me find a smartphone").
+  Trigger only when the message is essentially category-only with no spec/feature
+  mentioned. The system will guide them through clarification questions.
+
+- refine: user is reacting to PREVIOUS recommendations and wants to narrow,
+  change, or critique them (examples: "show me cheaper ones", "anything with a
+  better camera", "I don't like Samsung", "actually I prefer iPhone"). Trigger
+  whenever the conversation history already contains a recommendation and the
+  user is adjusting. The system will re-recommend with the updated filters
+  rather than asking new questions.
+
+- summarize: user wants a recap of preferences gathered so far (examples:
+  "what do you have so far?", "recap my preferences", "summarize", "what did
+  I tell you?"). Trigger on explicit recap requests. The system will state
+  what it understood without making changes.
+
+- done: user signals the conversation should END or RESTART (examples:
+  "I'm done", "that's all", "thanks, bye", "let's start over", "start again",
+  "reset", "new search", "begin again", "restart"). The conversation will be
+  cleared on the next message.
+
+- chitchat: greetings ("hi", "good morning"), generic thanks (not signaling
+  done), jokes, questions about you, or anything else NOT about finding a
+  product. When intent is chitchat, extracted_filters MUST be empty and
+  category MUST be null (do not invent values).
 
 CATEGORY SWITCHING:
 If the user pivots to a DIFFERENT product category mid-conversation (e.g. they
@@ -164,6 +263,10 @@ The assistant's previous question was about: "{last_asked}".
 If the user declines to specify (e.g. "any", "doesn't matter", "I don't care",
 "skip", "whatever", "either is fine"), simply DO NOT include a filter for that
 attribute. Don't invent a value.
+
+{vague_block}
+
+{critique_block}
 
 Current active filters: {active}
 Current category: {state['category'] or 'not set yet'}
@@ -258,12 +361,22 @@ def state_updater_node(state: DialogueState) -> dict:
 
 def retrieve_and_act_node(state: DialogueState) -> dict:
     """
-    Query the database, decide the next action via the fixed question order,
-    and (when recommending) pick the top 2 products by weighted score.
+    Decide the next system action based on intent + dialogue state.
+
+    Intent-driven branching:
+      - specific (with filters): user has clear criteria → recommend immediately.
+      - refine: user is critiquing prior results → re-recommend with new filters.
+      - summarize: user wants a recap → no DB action, response_generator does the talk.
+      - explore (or specific with no filters yet): guided question flow.
+      - done / chitchat / no category: handled before retrieval.
+
     Pure Python — no LLM call.
     """
+    intent = state["intent"]
+    category = state["category"]
+
     # No category yet → must ask
-    if not state["category"]:
+    if not category:
         return {
             "action": "ask_category",
             "candidates": [],
@@ -271,8 +384,8 @@ def retrieve_and_act_node(state: DialogueState) -> dict:
             "last_asked_attribute": None,
         }
 
-    # User signaled they're done
-    if state["intent"] == "done":
+    # User signaled they're done / restarting
+    if intent == "done":
         return {
             "action": "done",
             "candidates": [],
@@ -280,15 +393,17 @@ def retrieve_and_act_node(state: DialogueState) -> dict:
             "last_asked_attribute": None,
         }
 
-    # Off-topic / small-talk — respond warmly and remind scope.
-    # Preserve candidates / clarification_attribute / last_asked_attribute so the
-    # response can gently reprompt any pending question (we only override action).
-    if state["intent"] == "chitchat":
+    # Off-topic / small-talk — preserve candidates + pending question.
+    if intent == "chitchat":
         return {"action": "chitchat"}
 
-    # Pull the FULL filtered set — both so the sidebar count reflects reality,
-    # and so the scorer ranks across all matches (not just the cheapest 50).
-    candidates = database.retrieve(state["category"], state["active_filters"], limit=None)
+    # Recap request — keep candidates + clarification context so the response
+    # generator can summarize the current preferences without changing them.
+    if intent == "summarize":
+        return {"action": "summarize"}
+
+    filters = state["active_filters"]
+    candidates = database.retrieve(category, filters, limit=None)
 
     if len(candidates) == 0:
         return {
@@ -298,27 +413,40 @@ def retrieve_and_act_node(state: DialogueState) -> dict:
             "last_asked_attribute": None,
         }
 
-    next_q = database.next_question(
-        state["category"],
-        state["active_filters"],
-        state.get("asked_skipped", []),
-    )
+    has_filters = bool(filters)
 
-    # Recommend when either we've already narrowed enough OR there are no more
-    # questions to ask. Return ALL candidates ranked by score (best first) so
-    # the user can browse and pick items to compare.
-    if len(candidates) <= 2 or next_q is None:
-        ranked = database.top_n_by_score(
-            state["category"], candidates, n=len(candidates)
-        )
+    def _recommend_return(ranked):
+        # Save stats of THIS recommendation set so the next turn can anchor
+        # relative critiques ('cheaper', 'bigger battery') against it.
         return {
             "action": "recommend",
             "candidates": ranked,
             "clarification_attribute": None,
             "last_asked_attribute": None,
+            "last_recommend_stats": database.candidate_stats(category, ranked),
         }
 
-    # Still narrowing → ask the next attribute from the fixed sequence
+    # SPECIFIC intent + concrete filters → user knows what they want; skip the
+    # question chain and recommend immediately. Falls through to explore-style
+    # guided flow when the LLM tagged "specific" but no filters were actually
+    # extracted (e.g. "I want a phone" mistakenly labeled specific).
+    if intent == "specific" and has_filters:
+        ranked = database.top_n_by_score(category, candidates, n=len(candidates))
+        return _recommend_return(ranked)
+
+    # REFINE intent → user critiquing previous recommendations; apply the new
+    # filter delta and re-recommend without asking more questions.
+    if intent == "refine":
+        ranked = database.top_n_by_score(category, candidates, n=len(candidates))
+        return _recommend_return(ranked)
+
+    # EXPLORE flow (default): guide through the fixed question sequence.
+    next_q = database.next_question(
+        category, filters, state.get("asked_skipped", [])
+    )
+    if len(candidates) <= 2 or next_q is None:
+        ranked = database.top_n_by_score(category, candidates, n=len(candidates))
+        return _recommend_return(ranked)
     return {
         "action": "ask_clarification",
         "candidates": candidates,
@@ -392,8 +520,21 @@ def response_generator_node(state: DialogueState) -> dict:
             "Identify the most restrictive preference and suggest relaxing it. "
             "Ask if they'd like to adjust."
         ),
+        "summarize": (
+            f"The user asked you to recap what you understand so far. "
+            f"Give a clear plain-English summary of the {category_label} category "
+            f"and the active preferences (listed in the session context). "
+            f"Format: 1-2 sentences naming the criteria. End with 'Is that right, "
+            f"or would you like to change anything?'. Do not list raw filter keys "
+            f"like 'price_usd_max' — translate to natural phrasing (e.g. "
+            f"'under $300', 'at least 8 GB RAM')."
+        ),
         "done": (
-            "The user is satisfied. Wish them well and offer to help with another search."
+            "The user wants to wrap up or start over. Reply warmly in ONE or TWO short sentences — "
+            "thank them and mention they can begin a fresh search any time. "
+            "The conversation history will be cleared automatically on their next message, "
+            "but DON'T mention that explicitly (no 'I'll reset' or technical talk). "
+            "Just keep it friendly and inviting."
         ),
         "chitchat": (
             "The user said something off-topic — a greeting, thanks, or small talk. "

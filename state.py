@@ -26,6 +26,7 @@ class DialogueState(TypedDict):
     clarification_attribute: Optional[str]  # which attribute to ask about next
     last_asked_attribute: Optional[str]     # attribute asked in the PREVIOUS turn (for skip detection)
     asked_skipped: List[str]                # attributes the user explicitly declined to filter on
+    last_recommend_stats: Optional[Dict[str, Dict[str, float]]]  # min/max/median of last recommendation set per scoreable attr — used to anchor refine-intent critiques like "cheaper" / "bigger battery"
 
     # ── Response ──────────────────────────────────────────────────────────────
     response: str                    # final assistant message shown to the user
@@ -47,6 +48,7 @@ def initial_state() -> DialogueState:
         clarification_attribute=None,
         last_asked_attribute=None,
         asked_skipped=[],
+        last_recommend_stats=None,
         response="",
         turn_count=0,
     )

@@ -146,16 +146,71 @@ The `DialogueState` TypedDict persists across turns and tracks:
 
 ---
 
-## Example Conversations
+## Sample Use Cases
 
-**Exploring:**
-> "I'm looking for a mid-range Android phone with a good camera"
+The system is designed around four kinds of user interaction. For each, the table below shows what information the recommender needs to act, and how it gets it.
 
-**Specific:**
-> "I need the cheapest Samsung with at least 8GB RAM"
+### 1. Specific lookup (user knows what they want)
+```
+User:      I want a Samsung Android phone with at least 8GB RAM
+System:    [intent=specific, filters={brand_name: samsung, os: android, ram_capacity_min: 8}]
+           → recommends 28 matches immediately, ranked by TOPSIS (no follow-up questions)
+```
+**Information needed:** brand, OS, hard spec floors. The user provides them upfront — the system extracts and recommends without prompting.
 
-**Refining:**
-> "Actually, show me something cheaper" or "I'd prefer over-ear headphones with noise cancellation"
+### 2. Exploration (user has only a category in mind)
+```
+User:      I want a smartphone
+System:    Which OS do you prefer — Android or iOS?
+User:      Android
+System:    What's your budget?
+User:      Under $400
+System:    [keeps asking through the fixed question chain: battery → camera → RAM → storage]
+System:    → recommends top-ranked Android phones under $400, all attributes considered
+```
+**Information needed:** sequence of attribute preferences. The system asks them in priority order (`QUESTION_ORDER`), respecting any "any" / "skip" answers.
+
+### 3. Refinement / critique (user reacts to recommendations)
+```
+User:      [recommended Samsung Android 8GB phones, $220-1719]
+User:      show me cheaper ones
+System:    [intent=refine, relative anchor = previous min = $220]
+           → keeps brand+os+ram filters, adds price_usd_max=220
+User:      and bigger battery
+System:    → keeps all prior filters, adds battery_capacity_min=5000 (previous max)
+User:      forget about Samsung, any brand
+System:    → removes brand filter (explicit removal), keeps the rest
+```
+**Information needed:** the previous recommendation's stats (min/max/median per attribute), stored in `last_recommend_stats`. The system anchors relative terms against those values and treats refines as ADDITIVE unless the user says "forget", "change", "I don't care about X".
+
+### 4. Vague language (user uses qualitative terms)
+```
+User:      I want a cheap Android phone
+System:    [maps "cheap" → price_usd_max = p25 of smartphone catalog = $147]
+           → recommends 138 candidates under $147
+
+User:      I want a premium iPhone with a great camera
+System:    [maps "premium" → price_usd_min = p75 = $411; "great camera" → primary_camera_rear_min = p75 = 64 MP]
+           → applies both filters
+```
+**Information needed:** the dataset's distribution percentiles. Computed once on startup by `database.vague_term_thresholds(category)` and injected into the intent-extraction prompt, so the LLM never invents thresholds.
+
+### Cross-cutting capabilities
+- **Category switching mid-conversation** ("actually, show me headphones") → wipes filters, restarts.
+- **Recap on demand** ("what do you have so far?") → bot summarizes preferences in natural English.
+- **Skip handling** ("any" / "doesn't matter") → attribute marked skipped, advances to next question.
+- **Chitchat** ("good morning", "thanks") → warm acknowledgement + scope reminder, preserves all product state.
+- **Done / restart** ("thanks, bye", "let's start over") → graceful close + auto-reset on next message.
+
+### What information does the system need? (spec question)
+At minimum:
+1. **The product category** (smartphone / headphones) — gates schema selection.
+2. **A set of structured filter values**, either directly extracted from user utterances (specific) or elicited via questions (explore).
+3. **An anchor for relative critiques** — the previous recommendation's distribution, needed to ground "cheaper", "bigger", "better".
+4. **A scoring function over multiple attributes** — used when many products match, to pick the top-N. Implemented as TOPSIS with per-category weights.
+5. **Dataset-derived percentile thresholds** — needed to translate vague qualitative terms ("cheap", "premium") into concrete filter bounds.
+
+Everything else (which questions to ask in what order, when to recommend vs ask, how to present results) is downstream of these.
 
 ---
 
