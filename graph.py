@@ -4,6 +4,8 @@ Builds and compiles the LangGraph conversation graph.
 Import `run_turn()` to process one user message and get back an updated state.
 """
 
+import os
+
 from langgraph.graph import StateGraph, END
 
 import observability
@@ -54,6 +56,13 @@ def run_turn(state: DialogueState, user_message: str, session_id: str = None) ->
     Returns:
         Updated DialogueState with new response, filters, candidates, etc.
     """
+    # Engine: the tool-calling AGENT is the default (it beat the pipeline on the
+    # eval gate — persona quality 0.41 -> 0.85, robustness 82% -> 93%). The legacy
+    # LangGraph pipeline below remains the fallback via ENGINE=pipeline.
+    if os.getenv("ENGINE", "agent").lower() != "pipeline":
+        from agent import run_turn_agent
+        return run_turn_agent(state, user_message, session_id)
+
     # Append user message to history before invoking
     updated_messages = state["messages"] + [{"role": "user", "content": user_message}]
 
