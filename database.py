@@ -52,11 +52,92 @@ def load_all() -> None:
         df = pd.read_csv(path)
         if category == "headphones":
             df = df.rename(columns=_HEADPHONE_COLUMN_MAP)
+        df = _attach_images(category, df)
         _dataframes[category] = df
         print(f"  [OK] Loaded {len(df)} {category}")
 
+
+def _attach_images(category: str, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add an `image_url` column from the offline image cache (datasets/
+    image_cache.json), if present. No network here — enrichment is done once by
+    enrich_images.py. Missing entries stay null and the UI shows a placeholder.
+    """
+    cache_path = Path("datasets/image_cache.json")
+    if not cache_path.exists():
+        return df
+    try:
+        import json
+        with open(cache_path, encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        return df
+    brand_col = "brand_name" if category == "smartphone" else "brand"
+    if brand_col not in df.columns or "model" not in df.columns:
+        return df
+
+    def _lookup(row):
+        key = f"{category}|{str(row[brand_col]).strip().lower()}|{str(row['model']).strip().lower()}"
+        entry = cache.get(key)
+        return entry.get("url") if entry else None
+
+    df = df.copy()
+    df["image_url"] = df.apply(_lookup, axis=1)
+    return df
+
 def get_categories() -> List[str]:
     return list(_dataframes.keys())
+
+
+# Generic words to ignore when matching a product NAME inside free text.
+_NAME_STOPWORDS = {
+    "show", "me", "the", "of", "for", "a", "an", "please", "specs", "spec",
+    "specification", "specifications", "detail", "details", "detailed", "give",
+    "tell", "about", "full", "what", "are", "is", "its", "it", "this", "that",
+    "and", "with", "more", "info", "information", "on", "phone", "smartphone",
+    "smartphones", "headphone", "headphones", "model", "features", "feature",
+    "all", "i", "want", "to", "know", "see", "can", "you", "do", "have",
+    # comparison filler — so "compare it with one more option" finds no false name
+    "compare", "comparison", "vs", "versus", "option", "options", "another",
+    "alternative", "alternatives", "between", "or", "against",
+}
+
+
+def find_product(category: str, text: str, min_score: float = 2.0) -> Optional[Dict[str, Any]]:
+    """
+    Best-effort resolve a product NAMED in free text (e.g. "specs of the Itel A23
+    Pro") to its catalog row. Returns the row dict, or None if nothing matches.
+    Scores primarily on MODEL-name token overlap, brand secondarily, and rewards
+    matching the full model name — so "Itel A23" picks "Itel A23" over "Itel A23
+    Pro" only if the bare model exists, else the closest.
+    """
+    import re
+    df = _dataframes.get(category)
+    if df is None or len(df) == 0:
+        return None
+    brand_col = "brand_name" if category == "smartphone" else "brand"
+    q = {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+         if t not in _NAME_STOPWORDS}
+    if not q:
+        return None
+
+    best, best_score = None, 0.0
+    for rec in df.to_dict("records"):
+        model = str(rec.get("model", "")).lower()
+        brand = str(rec.get(brand_col, "")).lower()
+        model_toks = set(re.findall(r"[a-z0-9]+", model))
+        brand_toks = set(re.findall(r"[a-z0-9]+", brand))
+        if not model_toks:
+            continue
+        model_hit = len(q & model_toks)
+        if model_hit == 0:                      # must match at least one model token
+            continue
+        brand_hit = len(q & brand_toks)
+        coverage = model_hit / len(model_toks)  # 1.0 = matched the whole model name
+        score = model_hit * 2 + brand_hit + coverage
+        if score > best_score:
+            best, best_score = rec, score
+    return best if best_score >= min_score else None
 
 # ── Filter helpers ─────────────────────────────────────────────────────────────
 
@@ -239,14 +320,26 @@ def next_question(
     asked_skipped: Optional[List[str]] = None,
 ) -> Optional[str]:
     """
-    Return the next attribute to ask the user about, or None if all questions
-    in QUESTION_ORDER have been answered or explicitly skipped.
+    Return the next attribute to ask about, or None if nothing useful is left.
+
+    Skips attributes that are: already answered, explicitly skipped, OR
+    non-discriminative given the current filters — i.e. every remaining
+    candidate shares the same value (e.g. don't ask "which OS?" once the brand
+    is Samsung, since all matches are Android). Asking those can't narrow.
     """
     order = QUESTION_ORDER.get(category, [])
     answered = {base_attr(k) for k in (filters or {}).keys()}
     skipped = set(asked_skipped or [])
+
+    df = None
+    if category in _dataframes:
+        df = _apply_filters(_dataframes[category].copy(), filters or {})
+
     for attr in order:
         if attr in answered or attr in skipped:
+            continue
+        # Non-discriminative? (0 or 1 distinct value among current candidates)
+        if df is not None and attr in df.columns and df[attr].nunique(dropna=True) <= 1:
             continue
         return attr
     return None
@@ -486,17 +579,50 @@ def score_breakdown(category: str, candidates: List[Dict]) -> List[List[Dict]]:
     return breakdowns
 
 
-def top_n_by_score(category: str, candidates: List[Dict], n: int = 2) -> List[Dict]:
+def top_n_by_score(
+    category: str,
+    candidates: List[Dict],
+    n: int = 2,
+    sort_by: Optional[tuple] = None,
+) -> List[Dict]:
     """
-    Pick the top-n candidates by weighted score. Ties are broken randomly.
-    Each returned dict includes a '_score' key (rounded to 1 decimal).
+    Rank candidates and return the top n. Each returned dict includes a
+    '_score' key (TOPSIS closeness, rounded to 1 decimal) for display.
+
+    Ordering:
+      - sort_by=None (default): order by TOPSIS score, random tie-break.
+      - sort_by=(attr, "asc"|"desc"): honor an explicit user sort preference
+        (e.g. "cheapest" → ("price_usd", "asc")). Products missing that
+        attribute are pushed to the end regardless of direction. The _score
+        is still attached so the UI shows match quality.
     """
     import random
 
     if not candidates:
         return []
     scores = score_candidates(category, candidates)
-    pairs = list(zip(candidates, scores))
-    random.shuffle(pairs)               # random order for ties
-    pairs.sort(key=lambda p: p[1], reverse=True)  # stable sort preserves shuffle for ties
-    return [{**c, "_score": round(s, 1)} for c, s in pairs[:n]]
+    scored = [{**c, "_score": round(s, 1)} for c, s in zip(candidates, scores)]
+
+    if sort_by:
+        attr, direction = sort_by
+        reverse = (direction == "desc")
+
+        def _num(c):
+            v = c.get(attr)
+            if v is None or _is_nan(v):
+                return None
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        present = [c for c in scored if _num(c) is not None]
+        missing = [c for c in scored if _num(c) is None]
+        present.sort(key=lambda c: _num(c), reverse=reverse)
+        ordered = present + missing
+    else:
+        random.shuffle(scored)                       # random order for ties
+        scored.sort(key=lambda c: c["_score"], reverse=True)
+        ordered = scored
+
+    return ordered[:n]

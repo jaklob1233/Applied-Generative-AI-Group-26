@@ -7,20 +7,116 @@ A LangGraph-powered chatbot that acts as a shop assistant for tech products.
 ```
 crs_project/
 ├── requirements.txt      # Python dependencies
-├── .env.example          # Copy to .env and fill in your keys
+├── .env                  # API keys + optional LangSmith tracing
 │
-├── state.py              # DialogueState TypedDict definition
-├── database.py           # Product CSV loader + filter engine
-├── nodes.py              # LangGraph node functions
-├── graph.py              # Graph assembly + run_turn() API
+│  ── Dialogue engine ──
+├── state.py              # DialogueState TypedDict
+├── graph.py              # LangGraph assembly + run_turn() (logs every turn)
+├── nodes.py              # 4 nodes: NLU → state update → retrieve/act → respond
+│
+│  ── NLU stack (de-risked: the prompt no longer does everything) ──
+├── llm_client.py         # Shared LLM client + JSON parsing
+├── nlu.py                # Split router (intent/confidence) + slot extractor
+├── schema.py             # Slot schema + validation (drops unknown/invalid slots)
+├── resolver.py           # Entity resolution: brand aliases + difflib fuzzy match
+│
+│  ── Retrieval & ranking ──
+├── database.py           # CSV loader + structured filter engine + TOPSIS
+├── semantic.py           # numpy TF-IDF hybrid retrieval ("good for travel")
+├── ranking.py            # Pluggable ranker (learned ↔ TOPSIS) + feedback flywheel
+│
+│  ── Platform ──
+├── memory.py             # Persistent per-user profiles (cross-session)
+├── observability.py      # Structured turn logs + analytics + LangSmith status
 │
 ├── app.py                # Streamlit chat UI  ← main entry point
 ├── test_cli.py           # CLI test (no UI needed)
 │
-└── datasets/             # Product CSVs
-    ├── reduced_file_smartphone_500.csv   # 500 smartphones (price in USD)
-    └── reduced_file_headphones_500.csv   # 500 headphones (price in USD)
+├── datasets/             # Product CSVs (smartphones, headphones — both USD)
+├── logs/                 # turns.jsonl, feedback.jsonl (auto-created)
+├── profiles/             # per-user JSON profiles (auto-created)
+└── models/               # trained ranker_<category>.json (auto-created)
 ```
+
+## Architecture (deployment-ready)
+
+Each turn flows through a 4-node LangGraph pipeline, but the heavy lifting is
+now split into focused, independently-testable modules:
+
+```
+user message
+   │
+   ▼  nlu.route()         small classifier → intent + category + wants_results
+   │                      + sort_preference + CONFIDENCE   (low → ask to clarify)
+   ▼  nlu.extract_slots() given the category, pull ONLY filters
+   │
+   ▼  schema.validate_filters()  coerce types · resolve brands/categoricals via
+   │                      resolver · range-check · DROP unknown/invalid slots
+   ▼  state_updater       merge filters · category switch · skip detection ·
+   │                      mixed-initiative UNDO ("ignore that")
+   ▼  retrieve_and_act    structured filter → ranking.rank()  (learned model if
+   │                      trained, else TOPSIS; blends semantic.py for vibe
+   │                      queries; honors "cheapest" sort)
+   ▼  respond             natural-language reply
+```
+
+**Why this shape (CTO notes):**
+
+- **Validation, not trust.** Every LLM-proposed slot is checked against a schema
+  (`schema.py`). Misplaced control fields, wrong types, hallucinated brands, and
+  out-of-range numbers are dropped with a logged reason — they can't reach the
+  query engine. This replaced an endless cycle of patching the prompt.
+- **Entity resolution as a layer** (`resolver.py`): "iphone"→apple, "over ear"→
+  Over-Ear, "samsng"→samsung (fuzzy) via alias dicts + stdlib difflib — not prompt
+  rules.
+- **Confidence-gated clarification.** When the router is unsure and nothing is
+  actionable, the system asks instead of guessing.
+- **Observability** (`observability.py`): every turn is one JSON line
+  (utterance → intent → confidence → raw/validated/dropped slots → action →
+  latency). The sidebar **📊 Analytics** panel reads these live. Set
+  `LANGCHAIN_TRACING_V2=true` + `LANGCHAIN_API_KEY` in `.env` for full LangSmith
+  traces.
+- **Hybrid retrieval** (`semantic.py`): structured filters can't express "good for
+  travel" or "punchy bass". Spec-derived product descriptions are embedded with
+  **dense static embeddings** (`model2vec`, ~30 MB, no torch) so "long airplane
+  trips" matches noise-cancelling headphones with zero shared words — then blended
+  into ranking. Auto-falls back to a numpy TF-IDF index if the model can't load
+  (offline). `CRS_SEMANTIC_BACKEND=embeddings|tfidf|auto`.
+- **Confidence-gated clarification**: the router emits an `ambiguous` intent (and a
+  confidence score); genuinely unclear messages ("hmm idk something") get a
+  clarifying question instead of a wrong guess.
+- **Multi-intent**: a second product type in one message ("cheap Samsung phones
+  *and also headphones*") is captured as `also_category` — handled one at a time,
+  with the second offered in the reply rather than dropped.
+- **Drop-off funnel** (`observability.analytics()['funnel']`): conversion rate
+  (% conversations reaching a recommendation), abandonment at the question stage,
+  and average turns-to-recommend — surfaced in the sidebar.
+- **Capability boundaries** (`out_of_scope` intent): requests the system genuinely
+  can't fulfill — purchasing/checkout, stock, warranty/returns, written reviews —
+  are answered honestly ("I can't do that, but I can share specs / compare / filter")
+  instead of silently misfiring.
+- **Product images** (`images.py` + `enrich_images.py`): images are sourced
+  **offline into the catalog**, never fetched live per request (the right pattern for
+  latency/reliability/licensing). `enrich_images.py` populates
+  `datasets/image_cache.json` via a **pluggable, tiered resolver**:
+  **GSMArena** (phones only — best coverage incl. budget brands) → SerpAPI / Google
+  Custom Search (broad, needs a free key) → Wikipedia / Openverse (Creative-Commons,
+  free, partial) → honest placeholder (never a fake/AI photo). `database.load_all()`
+  joins the cache into an `image_url` column; the recommendation cards render it.
+  Run once: `python enrich_images.py` (add `--force` to re-fetch all phones as
+  uniform GSMArena shots; set `SERPAPI_API_KEY` for full headphone coverage).
+  Toggle GSMArena with `CRS_ENABLE_GSMARENA=0`.
+  **Caveat:** GSMArena has no public API — this scrapes it politely (offline, cached,
+  rate-limited), which is fine for an academic demo but against their ToS for
+  commercial use. Production swaps the tier-1 source for a licensed feed (Icecat /
+  Best Buy / Amazon) by editing one function — nothing else changes.
+- **Memory** (`memory.py`): per-user profiles persist preferred brand/OS, typical
+  budget, and last filters across sessions. Returning users get a personalized
+  greeting and a **⭐ Use my usual preferences** shortcut.
+- **The flywheel** (`ranking.py`): the **👍 Pick this** button logs which product
+  a user chose among those shown. `ranking.train(category)` fits a logistic model
+  over those choices, replacing the hand-tuned TOPSIS weights with learned ones.
+  Until enough data exists, it falls back to TOPSIS automatically.
 
 ## Setup
 
