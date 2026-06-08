@@ -51,12 +51,16 @@ def _filt(s):      return s.get("active_filters", {}) or {}
 def _nprod(s):     return len(s.get("candidates", []) or [])
 def _action(s):    return s.get("action")
 
-# Per-turn latency (deployment metric): every system turn is timed through here.
+# Per-turn latency + token cost (deployment metrics): every turn flows through here.
 _LATENCIES = []
+_TOKENS = []
 def _timed_run(s, msg):
     _t = time.time()
     s = run_turn(s, msg)
     _LATENCIES.append(time.time() - _t)
+    tk = s.get("last_turn_tokens")
+    if isinstance(tk, dict):
+        _TOKENS.append(tk)
     return s
 
 
@@ -384,7 +388,7 @@ def main():
             for iss in issues:
                 print(f"        - {iss}")
 
-    # ── Latency (deployment metric) ──────────────────────────────────────────
+    # ── Latency + token cost (deployment metrics) ────────────────────────────
     latency = None
     if _LATENCIES:
         lat = sorted(_LATENCIES)
@@ -392,6 +396,15 @@ def main():
         p95 = lat[min(len(lat) - 1, int(0.95 * len(lat)))]
         latency = {"avg_s": round(avg, 2), "p95_s": round(p95, 2),
                    "max_s": round(lat[-1], 2), "n_turns": len(lat)}
+    tokens = None
+    if _TOKENS:
+        n = len(_TOKENS)
+        tokens = {
+            "avg_in": round(sum(t.get("in", 0) for t in _TOKENS) / n),
+            "avg_out": round(sum(t.get("out", 0) for t in _TOKENS) / n),
+            "avg_cached": round(sum(t.get("cached", 0) for t in _TOKENS) / n),
+            "turns": n,
+        }
 
     # ── Aggregate scorecard ──────────────────────────────────────────────────
     persona_overall = (round(sum(p["scores"]["overall"] for p in personas) / len(personas), 3)
@@ -408,6 +421,7 @@ def main():
             "by_persona": {p["id"]: p["scores"] for p in personas},
         } if personas else "skipped",
         "latency": latency,
+        "tokens": tokens,
         "elapsed_s": round(time.time() - t0, 1),
     }
     scorecard["engine"] = engine
@@ -423,6 +437,9 @@ def main():
     if latency:
         print(f"  Latency/turn      : avg {latency['avg_s']}s, p95 {latency['p95_s']}s "
               f"({latency['n_turns']} turns)")
+    if tokens:
+        print(f"  Tokens/turn       : in {tokens['avg_in']} (cached {tokens['avg_cached']}), "
+              f"out {tokens['avg_out']}")
     print(f"  Saved {out_file}   (engine={engine}, {scorecard['elapsed_s']}s)")
     print("=" * 70)
 
