@@ -1,6 +1,47 @@
 # Conversational Recommender System
 
-A LangGraph-powered chatbot that acts as a shop assistant for tech products.
+A multi-turn LLM **shop assistant** for smartphones & headphones. It began as a structured
+LangGraph pipeline and was **re-architected into a hybrid tool-calling agent**, validated by a
+purpose-built evaluation harness. The agent is the **default engine**; the pipeline is the fallback.
+
+## Architecture v2 — Hybrid tool-calling agent (default)
+
+The dialogue brain is an LLM that **plans and calls deterministic tools** (`tools.py`) — `search`,
+`details`, `compare`, `explain`, `top-picks`, `catalog` — over the same retrieval/ranking core.
+Grounding lives in the tools (they return only real catalog data, validate every filter, honour an
+explicit count `n`, and report out-of-catalog names honestly); the LLM only decides *which* tools to
+call and composes the reply. Deterministic guardrails handle the precise bits (undo, brand exclusion).
+
+**Why we re-architected.** The v1 intent pipeline was whack-a-mole — every new phrasing needed a new
+intent/regex, and fixing one scenario broke another (e.g. "suggest me **2** best phones" ignored the
+count). The agent makes open-ended and compound requests *just work* via tool composition, with **no
+per-scenario code**.
+
+**Proven on an evaluation gate.** `eval_harness.py` (persona conversation simulation + LLM-judge + 28
+adversarial/safety checks + latency/cost) A/B-tests both engines on the *same* engine-agnostic gate:
+
+| Metric | Pipeline | **Agent** |
+|---|---|---|
+| Persona conversation quality (LLM-judge) | 0.41 | **0.81** |
+| Adversarial & safety | 82% | **100%** |
+| count / compound requests | 1/6 | **6/6** |
+| Latency / turn (avg) | 7.2s | **4.6s** |
+| Input tokens cached | — | **~52%** |
+
+```bash
+streamlit run app.py                     # agent (default)
+ENGINE=pipeline streamlit run app.py     # legacy pipeline (fallback)
+
+python eval_harness.py                   # evaluate the agent     -> eval_agent.json
+ENGINE=pipeline python eval_harness.py   # evaluate the pipeline  -> eval_baseline.json
+python test_tools.py                     # fast deterministic tool unit-tests
+```
+
+**v2 modules:** `agent.py` (tool-calling loop + policy + guardrails), `tools.py` (validated tools +
+OpenAI function-calling schemas + dispatch), `eval_harness.py` (the gate), `test_tools.py`.
+
+> The sections below document the **v1 structured pipeline** — now the *deterministic core* the agent
+> calls, and the engine you get with `ENGINE=pipeline`.
 
 ## Project Structure
 
@@ -9,10 +50,12 @@ crs_project/
 ├── requirements.txt      # Python dependencies
 ├── .env                  # API keys + optional LangSmith tracing
 │
-│  ── Dialogue engine ──
+│  ── Engine ──
+├── agent.py              # v2: tool-calling AGENT loop + policy + guardrails (DEFAULT)
+├── tools.py              # validated tools (search/details/compare/explain/catalog) + schemas
+├── graph.py              # run_turn() dispatch: ENGINE=agent (default) | pipeline (fallback)
 ├── state.py              # DialogueState TypedDict
-├── graph.py              # LangGraph assembly + run_turn() (logs every turn)
-├── nodes.py              # 4 nodes: NLU → state update → retrieve/act → respond
+├── nodes.py              # v1 pipeline: 4 nodes (NLU → state update → retrieve/act → respond)
 │
 │  ── NLU stack (de-risked: the prompt no longer does everything) ──
 ├── llm_client.py         # Shared LLM client + JSON parsing
@@ -30,6 +73,11 @@ crs_project/
 ├── observability.py      # Structured turn logs + analytics + LangSmith status
 │
 ├── app.py                # Streamlit chat UI  ← main entry point
+│
+│  ── Evaluation ──
+├── eval_harness.py       # persona sim + LLM-judge + 28 adversarial/safety checks (eval_*.json)
+├── test_tools.py         # deterministic tool unit-tests
+├── evaluate.py           # deterministic suites (resolution / validation / intent)
 ├── test_cli.py           # CLI test (no UI needed)
 │
 ├── datasets/             # Product CSVs (smartphones, headphones — both USD)

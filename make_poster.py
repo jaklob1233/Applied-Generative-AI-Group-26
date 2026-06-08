@@ -19,8 +19,8 @@ from reportlab.pdfgen import canvas
 
 # ── CONFIG — EDIT THESE ──────────────────────────────────────────────────────
 TITLE = "Conversational Recommender System"
-SUBTITLE = ("A multi-turn LLM shop assistant for smartphones & headphones — validated NLU, "
-            "hybrid semantic retrieval, learned ranking & full observability")
+SUBTITLE = ("A multi-turn LLM shop assistant for phones & headphones — re-architected from a structured "
+            "pipeline into a hybrid tool-calling agent, proven on an evaluation gate")
 GROUP = "Group 26"
 COURSE = "Applied Generative AI · SS 2026"
 MEMBERS = ["Arthur Galois", "Jakob Meltzer", "Sofie Parkesaas", "Muhammad Azeem Shahzad"]
@@ -41,10 +41,15 @@ GREEN  = HexColor(0x16A34A)
 
 
 def load_metrics():
-    if os.path.exists("eval_results.json"):
-        with open("eval_results.json", encoding="utf-8") as f:
-            return json.load(f)
-    return None
+    def _load(f):
+        if os.path.exists(f):
+            with open(f, encoding="utf-8") as fh:
+                return json.load(fh)
+        return {}
+    # New harness scorecards (agent vs the legacy pipeline) + the old deterministic file.
+    return {"agent": _load("eval_agent.json"),
+            "baseline": _load("eval_baseline.json"),
+            "legacy": _load("eval_results.json")}
 
 
 # ── Low-level drawing helpers (top-left coordinate system) ───────────────────
@@ -125,15 +130,16 @@ def page1(c, m):
     c.setFillColor(white)
     c.setFont("Helvetica-Bold", 40)
     c.drawString(40, Y(64), TITLE)
-    c.setFont("Helvetica", 15)
-    for i, ln in enumerate(simpleSplit(SUBTITLE, "Helvetica", 15, PW - 360)):
-        c.drawString(40, Y(92 + i * 20), ln)
+    c.setFont("Helvetica", 14)
+    for i, ln in enumerate(simpleSplit(SUBTITLE, "Helvetica", 14, PW - 540)):
+        c.drawString(40, Y(92 + i * 19), ln)
     # group block (right)
     c.setFont("Helvetica-Bold", 20)
-    c.drawRightString(PW - 40, Y(56), GROUP)
+    c.drawRightString(PW - 40, Y(54), GROUP)
     c.setFont("Helvetica", 12)
-    c.drawRightString(PW - 40, Y(78), COURSE)
-    c.drawRightString(PW - 40, Y(98), " · ".join(MEMBERS))
+    c.drawRightString(PW - 40, Y(74), COURSE)
+    c.setFont("Helvetica", 11)
+    c.drawRightString(PW - 40, Y(96), " · ".join(MEMBERS))
 
     top = 175
     colw = (PW - 80 - 30) / 2
@@ -141,15 +147,16 @@ def page1(c, m):
     # Abstract (left)
     by = panel(c, 40, top, colw, 250, "Abstract", INDIGO)
     abstract = (
-        "We build a conversational recommender that acts as a shop assistant for tech products. "
-        "Through multi-turn natural-language dialogue it elicits user preferences, reasons over an "
-        "explicit dialogue state, and recommends concrete products. NLU is split into a routing + "
-        "slot-filling pipeline guarded by schema validation and an entity-resolution layer; vague "
-        "language (“cheap”, “good camera”) is grounded in dataset percentiles; retrieval blends "
-        "structured pandas filters with dense-embedding semantic search for use-case (“vibe”) queries; "
-        "products are ranked by TOPSIS, upgradable to a learned ranker via a click-feedback flywheel. "
-        "A LangGraph state machine orchestrates four nodes; every turn is traced (LangSmith) and logged "
-        "for analytics, and recommendations show real product photos."
+        "We build a conversational recommender that acts as a shop assistant for tech products, and "
+        "take it from prototype to a deployable design. v1 is a structured LangGraph pipeline: split "
+        "NLU (router + slot-filling) guarded by schema validation and entity resolution, vague language "
+        "(“cheap”, “good camera”) grounded in dataset percentiles, hybrid pandas + dense-embedding "
+        "retrieval, and TOPSIS ranking. Adding intents one-by-one proved brittle (whack-a-mole), so we "
+        "built an evaluation harness — persona conversation simulation + LLM-judge + adversarial/safety "
+        "suites — and re-architected the dialogue brain into a hybrid tool-calling AGENT over the same "
+        "deterministic core. On the shared gate the agent roughly DOUBLES conversation quality "
+        "(0.41->0.81), reaches 100% on adversarial/safety, fixes count/compound requests, and runs "
+        "faster — with no per-scenario code. The pipeline is retained as a fallback."
     )
     wrapped(c, abstract, 58, by + 6, colw - 36, leading=15.5, size=11)
 
@@ -177,11 +184,11 @@ def page1(c, m):
         ("1 · Specific lookup", "“A Samsung Android phone with 8GB RAM”",
          "Pre-fills brand+OS+spec, recommends immediately — ranked, no needless questions."),
         ("2 · Guided exploration", "“I want a smartphone”",
-         "Asks a focused sequence: OS → price → battery → camera → RAM, with ‘any/skip’."),
+         "Asks a focused sequence: OS -> price -> battery -> camera -> RAM, with ‘any/skip’."),
         ("3 · Refinement / critique", "“cheaper ones” · “bigger battery”",
          "Anchors relative terms to the last results; refines are additive; ‘forget X’ removes."),
         ("4 · Vague & vibe language", "“cheap phone for gaming”",
-         "Maps ‘cheap’→p25 price; ‘gaming’ via semantic embeddings over spec descriptions."),
+         "Maps ‘cheap’->p25 price; ‘gaming’ via semantic embeddings over spec descriptions."),
     ]
     cw = (PW - 80 - 36 - 30) / 4
     for i, (h, ex, d) in enumerate(cards):
@@ -207,14 +214,14 @@ def page1(c, m):
 
 def page2(c, m):
     c.setFillColor(INK); c.setFont("Helvetica-Bold", 26)
-    c.drawString(40, Y(48), "Approach — System Architecture")
+    c.drawString(40, Y(48), "Approach — From Pipeline to Tool-Calling Agent")
     c.setFillColor(MUTED); c.setFont("Helvetica", 13)
-    c.drawString(40, Y(70), "LangGraph 4-node pipeline · de-risked NLU · hybrid retrieval · learned ranking · observability")
+    c.drawString(40, Y(70), "v2: a hybrid tool-calling agent over a deterministic core (the v1 pipeline below, retained as fallback)")
 
     # ── Pipeline (the centrepiece) ──
     pipe = ["User\nmessage", "ROUTER\nintent · conf\nsort · category",
             "SLOT\nEXTRACTOR\nfilters", "VALIDATE\n+ RESOLVE\ndrop bad slots",
-            "STATE\nUPDATER\nmerge · switch\nundo", "RETRIEVE\n& ACT\nfilter → rank",
+            "STATE\nUPDATER\nmerge · switch\nundo", "RETRIEVE\n& ACT\nfilter -> rank",
             "RESPONSE\nLLM reply"]
     n = len(pipe)
     bw, bh, gap = 138, 96, 22
@@ -245,9 +252,9 @@ def page2(c, m):
     # ── Cross-cutting platform rails ──
     rails = [
         ("MEMORY", "per-user profiles · ‘use my usual’ · personalised greeting", INDIGO),
-        ("RANKING", "TOPSIS (MCDM) ↔ learned LTR · semantic blend · feedback flywheel", PINK),
+        ("RANKING", "TOPSIS (MCDM) <-> learned LTR · semantic blend · feedback flywheel", PINK),
         ("OBSERVABILITY", "LangSmith tracing · per-turn JSONL · intent & funnel analytics", VIOLET),
-        ("IMAGES", "offline enrichment → GSMArena/Wikipedia → image_url → cards", INDIGO),
+        ("IMAGES", "offline enrichment -> GSMArena/Wikipedia -> image_url -> cards", INDIGO),
     ]
     ry = 230
     rw = (PW - 80 - 3 * 14) / 4
@@ -280,14 +287,14 @@ def page2(c, m):
     ty = panel(c, tx, dtop, colw, 300, "Models & Tools", PINK)
     ty += 2
     rows = [
-        ("Orchestration", "LangGraph state machine (4 nodes) + LangChain"),
-        ("LLM", "OpenRouter · GPT-4o-mini (router, extractor, responder)"),
+        ("Engine", "Tool-calling agent (default) <-> LangGraph pipeline (fallback)"),
+        ("Tools", "search · details · compare · explain · top-picks · catalog"),
+        ("LLM", "OpenRouter · GPT-4o-mini (function-calling) · local Ollama opt."),
         ("Embeddings", "model2vec · potion-base-8M (static, no GPU)"),
-        ("Data / retrieval", "pandas + numpy · 2×500 product catalog"),
         ("Ranking", "TOPSIS (Hwang & Yoon) · numpy logistic LTR"),
-        ("UI", "Streamlit chat · comparison tables · product cards"),
-        ("Observability", "LangSmith · structured JSONL logs"),
-        ("Images", "GSMArena / Wikipedia / Openverse enrichment"),
+        ("Data / UI", "pandas · 2×500 catalog · Streamlit chat + cards + radar"),
+        ("Observability", "LangSmith · per-turn JSONL · tokens & latency"),
+        ("Evaluation", "persona sim + LLM-judge + 28 adversarial/safety checks"),
     ]
     for k, v in rows:
         c.setFillColor(HexColor(0xBE185D)); c.setFont("Helvetica-Bold", 10.5)
@@ -298,16 +305,16 @@ def page2(c, m):
 
     # ── Conversational capabilities (fills the lower band) ──
     cap_top = 638
-    panel(c, 40, cap_top, PW - 80, 165, "Conversational Capabilities — intents → system actions", VIOLET)
+    panel(c, 40, cap_top, PW - 80, 165, "Conversational Capabilities — intents -> system actions", VIOLET)
     caps = [
-        ("explore", "category only → guided questions (OS→price→battery→camera→RAM)"),
-        ("specific", "concrete criteria → recommend or one narrowing question"),
+        ("explore", "category only -> guided questions (OS->price->battery->camera->RAM)"),
+        ("specific", "concrete criteria -> recommend or one narrowing question"),
         ("refine", "react to results: ‘cheaper’ anchored to last set; additive merges"),
         ("summarize", "recap understood preferences in plain language"),
-        ("done", "wrap-up / pick one / restart → clean close + new-search"),
-        ("chitchat", "greetings/thanks → warm reply, product state preserved"),
-        ("ambiguous", "too vague → ask to clarify (confidence-gated)"),
-        ("out_of_scope", "photos/buy/stock/warranty → honest ‘can’t, but I can…’"),
+        ("done", "wrap-up / pick one / restart -> clean close + new-search"),
+        ("chitchat", "greetings/thanks -> warm reply, product state preserved"),
+        ("ambiguous", "too vague -> ask to clarify (confidence-gated)"),
+        ("out_of_scope", "photos/buy/stock/warranty -> honest ‘can’t, but I can…’"),
     ]
     gw = (PW - 80 - 36 - 3 * 12) / 4
     for i, (k, v) in enumerate(caps):
@@ -339,21 +346,37 @@ def page3(c, m):
     c.setFillColor(INK); c.setFont("Helvetica-Bold", 26)
     c.drawString(40, Y(48), "Results, Demo & Learnings")
 
-    # Metrics row
-    suites = (m or {}).get("suites", {})
-    def pct(name, default="—"):
-        s = suites.get(name)
-        return f"{s['pct']}%" if s else default
-    lat = (m or {}).get("avg_latency_s_per_turn")
-    img = (m or {}).get("image_coverage_pct", {})
+    # Metrics row — the hybrid AGENT vs the legacy PIPELINE, on the SAME eval gate.
+    def g(d, *keys, default=None):
+        for k in keys:
+            d = d.get(k) if isinstance(d, dict) else None
+            if d is None:
+                return default
+        return d
+    A = (m or {}).get("agent", {}) or {}
+    B = (m or {}).get("baseline", {}) or {}
+
+    def cc(d):  # count + compound passes / total
+        bt = g(d, "robustness", "by_tag", default={}) or {}
+        co, cp = bt.get("count", {}), bt.get("compound", {})
+        return (co.get("pass", 0) + cp.get("pass", 0), co.get("total", 0) + cp.get("total", 0))
+    cca, cct = cc(A)
+    ccb, _ = cc(B)
+    cache, tin = g(A, "tokens", "avg_cached"), g(A, "tokens", "avg_in")
+    cache_pct = f"{round(100 * cache / tin)}%" if cache and tin else "—"
 
     metrics = [
-        (pct("Intent routing"), "Intent routing\naccuracy"),
-        (pct("Entity resolution"), "Entity resolution\naccuracy"),
-        (pct("Slot validation"), "Slot validation\n(bad slots caught)"),
-        (pct("End-to-end task success"), "End-to-end\ntask success"),
-        (f"{img.get('smartphone','—')}%", "Phone image\ncoverage"),
-        (f"{lat}s" if lat else "—", "Avg latency\nper turn"),
+        (str(g(A, "personas", "overall", default="—")),
+         f"Conversation\nquality (was {g(B, 'personas', 'overall', default='—')})"),
+        (f"{g(A, 'robustness', 'pct', default='—')}%",
+         f"Adversarial &\nsafety (was {g(B, 'robustness', 'pct', default='—')}%)"),
+        (f"{g(A, 'latency', 'avg_s', default='—')}s",
+         f"Latency / turn\n(was {g(B, 'latency', 'avg_s', default='—')}s)"),
+        (f"{g(A, 'deterministic', 'Intent routing', 'pct', default='—')}%",
+         "Intent routing\naccuracy"),
+        (f"{cca}/{cct}" if cct else "—",
+         f"count+compound\n(was {ccb}/{cct})" if cct else "count + compound"),
+        (cache_pct, "Input tokens\ncached"),
     ]
     mw = (PW - 80 - 5 * 12) / 6
     mtop = 72
@@ -366,20 +389,21 @@ def page3(c, m):
         for j, ln in enumerate(lab.split("\n")):
             c.drawCentredString(mx + mw / 2, Y(mtop + 62 + j * 12), ln)
     c.setFillColor(MUTED); c.setFont("Helvetica-Oblique", 9)
-    c.drawString(40, Y(mtop + 104), "Metrics from evaluate.py: 20 resolution + 10 validation (deterministic), "
-                                    "22 intent + 10 multi-turn scenarios (LLM-graded).")
+    c.drawString(40, Y(mtop + 104),
+                 "Same engine-agnostic gate, both engines: 28 adversarial/safety checks + 10 persona "
+                 "conversations (LLM-judge) + deterministic suites + latency/cost.  python eval_harness.py")
 
     # Example conversation (left)
     ctop = 200
     colw = (PW - 80 - 30) / 2
     cy = panel(c, 40, ctop, colw, 300, "Demo — Example Conversation", VIOLET)
     convo = [
-        ("u", "a cheap android phone with a good camera"),
-        ("a", "Found 60 matches — top pick: Realme 9 Pro 5G. (price≤$147, camera≥64MP applied)"),
-        ("u", "show me cheaper ones"),
-        ("a", "Narrowed to phones under $147, cheapest first. Want to compare a few?"),
-        ("u", "can you show pictures of this?"),
-        ("a", "I can't show photos here, but I can share full specs or compare options."),
+        ("u", "suggest me 2 best phones"),
+        ("a", "Two top picks by value: Xiaomi Redmi Note 12 Pro+ and the Explorer. (count = 2 honoured)"),
+        ("u", "compare them"),
+        ("a", "Side-by-side: the Pro+ leads on RAM & battery; the Explorer is cheaper. Cards below."),
+        ("u", "compare it with the iPhone 15 Pro Max"),
+        ("a", "I don't carry the iPhone 15 Pro Max — the closest I have is the iPhone 15 Pro. (no fabrication)"),
     ]
     yy = cy + 6
     for who, txt in convo:
@@ -405,32 +429,32 @@ def page3(c, m):
     c.setFillColor(GREEN); c.setFont("Helvetica-Bold", 11)
     c.drawString(lx + 18, Y(ly), "What worked"); ly += 16
     ly = bullets(c, [
-        "Schema validation eliminated a whole class of bugs (hallucinated / misplaced filters).",
-        "Entity resolution was the single biggest robustness win (‘iphone’→apple, typos).",
-        "Dense embeddings beat TF-IDF for ‘vibe’ queries (‘long flights’ ≈ noise-cancelling).",
-        "Splitting NLU + an info-gathering gate made multi-turn behaviour reliable.",
+        "Build the eval gate FIRST: persona sim + LLM-judge turned “feels better” into a number.",
+        "The tool-calling agent fixed open-world gaps (counts, compound, anaphora) with NO per-scenario code.",
+        "Grounding lives in deterministic tools; the LLM only plans -> honest, no fabricated specs.",
+        "Hybrid wins: deterministic guardrails (undo, brand-exclude) + an LLM brain beat either alone.",
     ], lx + 18, ly, colw - 36, size=10, leading=12.5, gap=2)
     ly += 4
     c.setFillColor(HexColor(0xB91C1C)); c.setFont("Helvetica-Bold", 11)
     c.drawString(lx + 18, Y(ly), "What was hard / we'd change"); ly += 16
     bullets(c, [
-        "LLMs occasionally emit a ‘null’ string or leak a percentile price cap — fixed with code guards.",
-        "Three LLM calls/turn → ~10s latency; route with a smaller/faster model next.",
-        "Free image sources miss budget brands — solved via GSMArena (100% phones; ToS caveat).",
-        "Learned ranker needs real click data to beat TOPSIS; flywheel is built, awaiting traffic.",
+        "Enumerating intents was whack-a-mole — fixing one scenario broke another; the agent removed the ceiling.",
+        "Optimising latency over-tightened replies and dropped quality — the gate caught it and we re-balanced.",
+        "Agent is cloud-first: function-calling on small local models is unreliable (a known trade-off).",
+        "A few personas are capped by the dataset (obscure products), not the system — richer data would lift them.",
     ], lx + 18, ly, colw - 36, size=10, leading=12.5, gap=2)
 
     # ── Lower band: methodology + reflection ──
     btop = 520
     my = panel(c, 40, btop, colw, 268, "Evaluation Methodology", INDIGO)
     bullets(c, [
-        "Deterministic suites (free, instant): 20 entity-resolution cases (aliases, typos, synonyms) "
-        "and 10 slot-validation cases (control fields, impossible values, unknown keys).",
-        "LLM suites: 22 single-utterance intent cases (incl. prior-context turns) and 10 multi-turn "
-        "scenarios graded by a state predicate (correct action + filters + non-empty results).",
-        "Reproducible via `python evaluate.py` → eval_results.json; this poster renders those numbers.",
-        "Iterative: the harness caught two real bugs (undo over-revert, fresh-search contamination) "
-        "which were fixed — task success rose 70% → 90%.",
+        "Engine-AGNOSTIC gate: judges observable behaviour, not internal labels -> fairly A/B-tests any engine.",
+        "28 adversarial/safety checks (count, compound, correction, scope, prompt-injection, PII, i18n, …) "
+        "plus deterministic resolution / validation / intent suites.",
+        "10 persona conversations: an LLM ‘customer’ drives multi-turn dialogues; an LLM-judge scores "
+        "goal / honored / grounded / helpful / safe. Plus per-turn latency + token cost.",
+        "Reproducible: `python eval_harness.py` (agent) vs `ENGINE=pipeline …` (baseline). The gate "
+        "drove the whole re-architecture and caught real regressions before they shipped.",
     ], 58, my + 4, colw - 36, size=10, leading=12.5, gap=3)
 
     rx2 = 40 + colw + 30
