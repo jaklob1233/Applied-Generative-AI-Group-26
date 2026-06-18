@@ -113,7 +113,10 @@ def _describe(category: str, p: Dict[str, Any]) -> str:
         tags = _headphone_tags(p)
     else:
         return ""
-    return (base + " " + " ".join(tags)).lower()
+    # Blend in the generated natural-language description (if enriched) so vibe
+    # queries can match richer wording, not just the spec tags.
+    extra = str(p.get("description") or "")
+    return (base + " " + " ".join(tags) + " " + extra).lower()
 
 
 def is_vibe_query(text: str) -> bool:

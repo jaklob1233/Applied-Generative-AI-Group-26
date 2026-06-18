@@ -19,6 +19,8 @@ Public surface:
   call_tool(name, args) -> dict   (validated dispatch)
 """
 
+import json
+import re
 from typing import Any, Dict, List, Optional
 
 import database
@@ -47,13 +49,24 @@ _STR_COLS = {"os", "type", "form_factor", "connectivity", "brand", "brand_name",
 _FILTER_KEYS = {
     "smartphone": ("brand_name, model_contains, os(android|ios|other), price_usd_min, price_usd_max, "
                    "rating_min(0-100), battery_capacity_min(mAh), fast_charging_min(W), "
-                   "ram_capacity_min(GB), internal_memory_min(GB), screen_size_min, screen_size_max, "
+                   "ram_capacity(GB, EXACT match) OR ram_capacity_min(GB, at-least), "
+                   "internal_memory(GB, EXACT match) OR internal_memory_min(GB, at-least), "
+                   "screen_size_min, screen_size_max, "
                    "num_rear_cameras_min, primary_camera_rear_min(MP), primary_camera_front_min(MP)"),
     "headphones": ("brand, model_contains, type(Wired|Wireless), connectivity(3.5mm|Bluetooth), "
                    "form_factor(In-Ear|On-Ear|Over-Ear), microphone(bool), noise_cancellation(bool), "
                    "foldable(bool), battery_hrs_min, price_usd_min, price_usd_max, avg_rating_min(0-5), "
                    "release_year_min, release_year_max"),
 }
+
+# Guard: every schema-enforced filter key must be advertised to the agent above, so the
+# human-readable vocabulary can't silently drift from the real capability — exactly how
+# the exact-match `ram_capacity` key once went unlisted and the agent wrongly claimed it
+# couldn't filter exact RAM. Fails fast at import (and in test_tools.py).
+for _cat in ("smartphone", "headphones"):
+    _undocumented = [k for k in schema.valid_slot_keys(_cat)
+                     if not re.search(rf"\b{re.escape(k)}\b", _FILTER_KEYS[_cat])]
+    assert not _undocumented, f"filter keys not advertised to the agent ({_cat}): {_undocumented}"
 
 
 # ── value/format helpers ─────────────────────────────────────────────────────
@@ -127,6 +140,56 @@ def _check_category(category):
     return category in CATEGORIES
 
 
+def _as_dict(v) -> Dict[str, Any]:
+    """Coerce a 'filters' arg to a dict. Tolerates a JSON string or a loose
+    'key=value, key=value' string — some models (e.g. Gemini) stringify object
+    arguments instead of passing JSON. Unknown/invalid keys are dropped downstream
+    by schema.validate_filters, so a best-effort parse is safe."""
+    if isinstance(v, dict):
+        return v
+    if not v:
+        return {}
+    if isinstance(v, str):
+        try:
+            j = json.loads(v)
+            if isinstance(j, dict):
+                return j
+        except Exception:
+            pass
+        out: Dict[str, Any] = {}
+        for part in re.split(r"[,;\n]+", v):
+            m = re.match(r"\s*['\"]?(\w+)['\"]?\s*[=:]\s*(.+?)\s*$", part)
+            if not m:
+                continue
+            key, val = m.group(1), m.group(2).strip().strip("'\"")
+            if re.fullmatch(r"-?\d+", val):
+                val = int(val)
+            elif re.fullmatch(r"-?\d+\.\d+", val):
+                val = float(val)
+            elif val.lower() in ("true", "false"):
+                val = val.lower() == "true"
+            out[key] = val
+        return out
+    return {}
+
+
+def _as_list(v) -> List[Any]:
+    """Coerce a list-typed arg a model may have stringified (JSON or comma-list)."""
+    if isinstance(v, list):
+        return v
+    if not v:
+        return []
+    if isinstance(v, str):
+        try:
+            j = json.loads(v)
+            if isinstance(j, list):
+                return j
+        except Exception:
+            pass
+        return [p.strip().strip("'\"") for p in re.split(r"[,;\n]+", v) if p.strip()]
+    return [v]
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 def search_products(category: str, filters: Optional[Dict] = None,
@@ -142,8 +205,9 @@ def search_products(category: str, filters: Optional[Dict] = None,
         n = max(1, min(int(n), 50))
     except (TypeError, ValueError):
         n = 5
-    clean, dropped = schema.validate_filters(category, dict(filters or {}))
+    clean, dropped = schema.validate_filters(category, _as_dict(filters))
     cands = database.retrieve(category, clean, limit=None)
+    exclude_brands = _as_list(exclude_brands)
     if exclude_brands:
         ex = {str(b).strip().lower() for b in exclude_brands}
         bcol = "brand_name" if category == "smartphone" else "brand"
@@ -217,6 +281,17 @@ def get_product_details(category: str, query: str) -> Dict[str, Any]:
         cv = _clean_val(extra, p.get(extra))
         if cv is not None:
             view[extra] = cv
+    # Enrichment (offline-generated from specs). Key names tell the LLM the review
+    # is AI-generated, so it is never presented as a real user review.
+    desc = p.get("description")
+    if isinstance(desc, str) and desc.strip():
+        view["description"] = desc.strip()
+    real = p.get("real_review")
+    if isinstance(real, str) and real.strip():
+        view["gsmarena_review_excerpt"] = real.strip()   # real editorial excerpt (flagships)
+    rev = p.get("review_summary")
+    if isinstance(rev, str) and rev.strip():
+        view["ai_review_summary"] = rev.strip()
     return {"found": True, "product": view}
 
 
@@ -226,7 +301,7 @@ def compare_products(category: str, queries: List[str]) -> Dict[str, Any]:
     if not _check_category(category):
         return _err(f"unknown category '{category}'", valid=list(CATEGORIES))
     products, unresolved, seen = [], [], set()
-    for q in (queries or [])[:3]:
+    for q in _as_list(queries)[:3]:
         p = database.find_product(category, str(q), min_score=4.0)
         key = _name(p, category).lower() if p else None
         if p and key not in seen:

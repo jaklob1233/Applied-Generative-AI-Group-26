@@ -102,7 +102,20 @@ def _to_lc(messages):
 
 
 def _text(content) -> str:
-    return content if isinstance(content, str) else str(content or "")
+    """Flatten an LLM message's content to plain text. OpenAI returns a string;
+    Gemini returns a LIST of content parts (e.g. {'type':'text','text':...} plus
+    'thinking' parts) — join the text parts and drop the rest."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, str):
+                parts.append(p)
+            elif isinstance(p, dict) and p.get("type") in (None, "text") and p.get("text"):
+                parts.append(str(p["text"]))
+        return "".join(parts).strip()
+    return str(content or "")
 
 
 def _handle_undo(state, user_message, session_id):
@@ -150,8 +163,8 @@ def run_turn_agent(state: DialogueState, user_message: str, session_id: str = No
     lc = [SystemMessage(_system_prompt(state))] + _to_lc(messages)
 
     base = llm_client.get_llm()
-    capped = base.bind(max_tokens=AGENT_MAX_TOKENS)               # cap generation cost/latency
-    llm = base.bind_tools(tools.TOOL_SCHEMAS).bind(max_tokens=AGENT_MAX_TOKENS)
+    capped = llm_client.cap_tokens(base, AGENT_MAX_TOKENS)         # cap generation cost/latency
+    llm = llm_client.cap_tokens(base.bind_tools(tools.TOOL_SCHEMAS), AGENT_MAX_TOKENS)
 
     artifact = None                                   # {"action","category","candidates"}
     working_cat = state.get("category")

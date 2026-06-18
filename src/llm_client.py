@@ -45,6 +45,10 @@ def _cloud_models() -> List[Dict[str, Any]]:
         m = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         return [{"id": f"openai:{m}", "provider": "openai", "model": m,
                  "label": m, "local": False}]
+    if provider in ("gemini", "vertex", "google"):
+        m = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+        return [{"id": f"gemini:{m}", "provider": "gemini", "model": m,
+                 "label": m, "local": False}]
     # openrouter (default)
     listed = os.getenv("OPENROUTER_MODELS", "").strip()
     names = [m.strip() for m in listed.split(",") if m.strip()]
@@ -123,6 +127,20 @@ def _build(spec: Dict[str, Any]):
             openai_api_base="https://openrouter.ai/api/v1",
             temperature=0,
         )
+    if provider in ("gemini", "vertex", "google"):
+        # Gemini on Vertex AI in EXPRESS mode: authenticate with a Vertex API key
+        # (no service account / ADC needed). The unified google-genai SDK handles
+        # this when GOOGLE_GENAI_USE_VERTEXAI=True + GOOGLE_API_KEY are set.
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        os.environ["GOOGLE_GENAI_USE_VERTEXAI"] = "True"
+        api_key = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or os.getenv("key")
+        if api_key:
+            os.environ["GOOGLE_API_KEY"] = api_key
+        return ChatGoogleGenerativeAI(
+            model=model,
+            temperature=0,
+            max_output_tokens=int(os.getenv("GEMINI_MAX_TOKENS", "2048")),
+        )
     if provider == "ollama":
         # Ollama speaks the OpenAI chat API at /v1 — reuse ChatOpenAI, no new dep.
         from langchain_openai import ChatOpenAI
@@ -152,6 +170,27 @@ def get_llm():
     if mid not in _cache:
         _cache[mid] = _build(spec)
     return _cache[mid]
+
+
+def cap_tokens(llm, max_tokens: int):
+    """Bind a generation-length cap using the parameter the ACTIVE provider accepts.
+    OpenAI-family uses `max_tokens`; Gemini/Vertex uses `max_output_tokens` and
+    rejects `max_tokens`. For Gemini the cap is already applied at build time, so we
+    return the model unchanged to avoid an invalid-argument error. Keeps the agent
+    engine-agnostic — it just calls cap_tokens() instead of .bind(max_tokens=...)."""
+    if get_active_model().get("provider") in ("gemini", "vertex", "google"):
+        return llm
+    return llm.bind(max_tokens=max_tokens)
+
+
+def get_llm_for(model_id: str):
+    """Build + cache a chat model for a SPECIFIC model id ('<provider>:<model>'),
+    independent of the active selection. Lets a caller run a second model alongside
+    the active one, e.g. an evaluation judge from a DIFFERENT family than the
+    system-under-test (to rule out shared-model bias)."""
+    if model_id not in _cache:
+        _cache[model_id] = _build(_spec_from_id(model_id))
+    return _cache[model_id]
 
 
 # ── JSON parsing helper (unchanged) ───────────────────────────────────────────

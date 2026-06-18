@@ -16,17 +16,22 @@ Three layers:
      multi-turn dialogues against run_turn(); an LLM judge grades each on a rubric.
   C. Deterministic suites      — re-uses evaluate.py (resolution/validation/intent).
 
-Run:   python eval_harness.py            (full; ~a few minutes, cloud LLM)
-       python eval_harness.py --quick    (skip persona sims)
+Run:   python eval_harness.py                 (full; ~a few minutes, cloud LLM)
+       python eval_harness.py --quick         (skip persona sims)
+       python eval_harness.py --runs 5        (repeat persona sims; report mean +/- std)
+       python eval_harness.py --judge-model openrouter:anthropic/claude-3.5-sonnet
+                                              (grade with a DIFFERENT family than the
+                                               system-under-test, to rule out judge bias)
 
 Cloud-primary by design (the simulator, judge, and system-under-test all run on
-the configured cloud model).
+the configured cloud model unless --judge-model overrides the judge).
 """
 
 import os
 import sys
 import json
 import time
+import statistics
 import traceback
 
 from dotenv import load_dotenv
@@ -274,6 +279,11 @@ Your next message:"""
 
 _JUDGE_DIMS = ["goal_achieved", "honored_requests", "grounded", "helpful", "safe_in_scope"]
 
+# Optional cross-family judge model (set from --judge-model). None => judge with
+# the active system model (cloud-primary default). Pointing the judge at a
+# different model family is the standard guard against shared-model bias.
+_JUDGE_LLM = None
+
 
 def _judge(persona, transcript):
     convo = "\n".join(f"{'Customer' if r == 'user' else 'Assistant'}: {m}" for r, m in transcript)
@@ -293,7 +303,7 @@ Return ONLY a JSON object:
 Conversation:
 {convo}
 """
-    out = get_llm().invoke(prompt)
+    out = (_JUDGE_LLM or get_llm()).invoke(prompt)
     j = parse_json_response(getattr(out, "content", "") or "")
     scores = {}
     for d in _JUDGE_DIMS:
@@ -334,6 +344,14 @@ def _pct(num, den):
     return round(100 * num / den) if den else 0
 
 
+def _arg(flag, default=None):
+    """Read `--flag value` from argv (returns default if the flag is absent)."""
+    a = sys.argv
+    if flag in a and a.index(flag) + 1 < len(a):
+        return a[a.index(flag) + 1]
+    return default
+
+
 def main():
     quick = "--quick" in sys.argv
     engine = os.getenv("ENGINE", "pipeline").lower()
@@ -371,22 +389,33 @@ def main():
                           "pct": _pct(r["correct"], r["total"])}
         print(f"    {r['name']:22} {r['correct']}/{r['total']} ({det[r['name']]['pct']}%)")
 
-    # ── B. Persona conversation simulations + judge ──────────────────────────
-    personas = []
+    # ── B. Persona conversation simulations + judge (optionally repeated) ─────
+    runs = max(1, int(_arg("--runs", 1)))
+    judge_model = _arg("--judge-model")
+    global _JUDGE_LLM
+    if judge_model:
+        _JUDGE_LLM = llm_client.get_llm_for(judge_model)
+    persona_runs = []   # list of {persona_id -> scores}, one dict per repeat
     if quick:
         print("\n[B] Persona simulations ... SKIPPED (--quick)")
     else:
-        print("\n[B] Persona conversation simulations + LLM judge ...")
-        for p in PERSONAS:
-            transcript, scores, issues = simulate(p)
-            turns = sum(1 for r, _ in transcript if r == "user")
-            personas.append({"id": p["id"], "turns": turns, "scores": scores, "issues": issues})
-            print(f"    {p['id']:14} overall={scores['overall']:.2f}  "
-                  f"(goal={scores['goal_achieved']:.1f} honored={scores['honored_requests']:.1f} "
-                  f"grounded={scores['grounded']:.1f} helpful={scores['helpful']:.1f} "
-                  f"safe={scores['safe_in_scope']:.1f})  turns={turns}")
-            for iss in issues:
-                print(f"        - {iss}")
+        jn = f"  judge={judge_model}" if judge_model else ""
+        print(f"\n[B] Persona conversation simulations + LLM judge ... ({runs} run(s)){jn}")
+        for ri in range(runs):
+            if runs > 1:
+                print(f"  -- run {ri + 1}/{runs} --")
+            run_scores = {}
+            for p in PERSONAS:
+                transcript, scores, issues = simulate(p)
+                turns = sum(1 for r, _ in transcript if r == "user")
+                run_scores[p["id"]] = scores
+                print(f"    {p['id']:14} overall={scores['overall']:.2f}  "
+                      f"(goal={scores['goal_achieved']:.1f} honored={scores['honored_requests']:.1f} "
+                      f"grounded={scores['grounded']:.1f} helpful={scores['helpful']:.1f} "
+                      f"safe={scores['safe_in_scope']:.1f})  turns={turns}")
+                for iss in issues:
+                    print(f"        - {iss}")
+            persona_runs.append(run_scores)
 
     # ── Latency + token cost (deployment metrics) ────────────────────────────
     latency = None
@@ -406,9 +435,27 @@ def main():
             "turns": n,
         }
 
-    # ── Aggregate scorecard ──────────────────────────────────────────────────
-    persona_overall = (round(sum(p["scores"]["overall"] for p in personas) / len(personas), 3)
-                       if personas else None)
+    # ── Aggregate persona scores (mean +/- std across runs) ───────────────────
+    persona_overall = None
+    persona_std = None
+    persona_block = "skipped"
+    if persona_runs:
+        ids = [p["id"] for p in PERSONAS]
+        run_means = [statistics.mean(rs[i]["overall"] for i in ids) for rs in persona_runs]
+        persona_overall = round(statistics.mean(run_means), 3)
+        persona_std = round(statistics.pstdev(run_means), 3) if len(run_means) > 1 else 0.0
+        by_persona = {}
+        for i in ids:
+            overalls = [rs[i]["overall"] for rs in persona_runs]
+            agg = {d: round(statistics.mean(rs[i][d] for rs in persona_runs), 3) for d in _JUDGE_DIMS}
+            agg["overall"] = round(statistics.mean(overalls), 3)
+            if len(overalls) > 1:
+                agg["overall_std"] = round(statistics.pstdev(overalls), 3)
+            by_persona[i] = agg
+        persona_block = {"overall": persona_overall, "runs": runs, "by_persona": by_persona}
+        if len(run_means) > 1:
+            persona_block["overall_std"] = persona_std
+
     scorecard = {
         "robustness": {
             "pass": rob_pass, "total": len(rob), "pct": _pct(rob_pass, len(rob)),
@@ -416,10 +463,7 @@ def main():
             "misses": [f"[{r['tag']}] {r['name']}" for r in rob if not r["ok"]],
         },
         "deterministic": det,
-        "personas": {
-            "overall": persona_overall,
-            "by_persona": {p["id"]: p["scores"] for p in personas},
-        } if personas else "skipped",
+        "personas": persona_block,
         "latency": latency,
         "tokens": tokens,
         "elapsed_s": round(time.time() - t0, 1),
@@ -433,7 +477,10 @@ def main():
     for name, d in det.items():
         print(f"  {name:18}: {d['correct']}/{d['total']} ({d['pct']}%)")
     if persona_overall is not None:
-        print(f"  Persona quality   : {persona_overall:.2f} / 1.00 (LLM-judge, {len(personas)} personas)")
+        pm = f" +/- {persona_std}" if (persona_std and runs > 1) else ""
+        jn = f", judge={judge_model}" if judge_model else ""
+        print(f"  Persona quality   : {persona_overall:.3f}{pm} / 1.00 "
+              f"(LLM-judge, {len(PERSONAS)} personas x {runs} run(s){jn})")
     if latency:
         print(f"  Latency/turn      : avg {latency['avg_s']}s, p95 {latency['p95_s']}s "
               f"({latency['n_turns']} turns)")

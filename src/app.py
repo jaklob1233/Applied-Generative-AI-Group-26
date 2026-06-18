@@ -396,6 +396,8 @@ def show_how_it_works():
         "- 📊 **Every pick is explained** — photo, full specs, and a match score you can expand.\n"
         "- ⚖️ **Compare & refine** — tick 2–3 to compare, or say *“cheaper”*, *“bigger battery”*, "
         "*“actually iPhone”*; say *“ignore that”* to undo.\n"
+        "- 💡 **Handy commands** — *“clear all filters”* / *“start over”* to reset, "
+        "*“what do you have so far?”* for a recap, *“actually, show me headphones”* to switch category.\n"
         "- ✅ **When happy**, say *“I'll take it”* / *“that's all”* to wrap up."
     )
     st.caption("Under the hood: validated NLU · semantic search · TOPSIS ranking · real product photos.")
@@ -587,32 +589,6 @@ with st.sidebar:
 
     # "Start new conversation" (🔄 New chat) and "How it works" now live in the
     # main top panel, so they're intentionally not duplicated in the sidebar.
-
-    # Observability panel — live analytics from the structured turn log.
-    with st.expander("📊 Analytics"):
-        import json
-        a = observability.analytics()
-        st.caption(f"LangSmith tracing: **{a['langsmith']}**")
-        m1, m2 = st.columns(2)
-        m1.metric("Turns logged", a["turns"])
-        m2.metric("Avg latency", f"{a['avg_latency_ms'] or 0:.0f} ms")
-        if a["avg_confidence"] is not None:
-            st.caption(f"Avg routing confidence: **{a['avg_confidence']}**")
-        f = a.get("funnel", {})
-        if f.get("sessions"):
-            st.caption("Conversion funnel:")
-            fc1, fc2 = st.columns(2)
-            fc1.metric("Reached rec.", f"{f.get('reached_recommend_pct', 0)}%")
-            fc2.metric("Dropped @ Q", f"{f.get('abandoned_at_question_pct', 0)}%")
-            if f.get("avg_turns_to_recommend") is not None:
-                st.caption(f"Avg turns to recommendation: **{f['avg_turns_to_recommend']}**")
-        if a["intents"]:
-            import pandas as pd
-            st.caption("Intent distribution:")
-            st.bar_chart(pd.DataFrame({"count": a["intents"]}))
-        if a["drop_reasons"]:
-            st.caption("Validation drops (robustness):")
-            st.json(a["drop_reasons"])
 
     # Debug expander
     with st.expander("🛠 Raw State (debug)"):
@@ -838,6 +814,18 @@ def _product_detail_dialog(p, category, breakdown, total, shown):
         sem = p.get("_semantic")
         if isinstance(sem, (int, float)) and sem > 0:
             st.caption(f"🔎 {sem:.0f}% match to your request")
+    desc = p.get("description")
+    if isinstance(desc, str) and desc.strip():
+        st.markdown(desc.strip())
+    real = p.get("real_review")
+    if isinstance(real, str) and real.strip():
+        url = p.get("real_review_url")
+        link = f"  [source ↗]({url})" if isinstance(url, str) and url.startswith("http") else ""
+        st.success(f"📝 **GSMArena review** (excerpt):{link}\n\n{real.strip()}")
+    else:
+        rev = p.get("review_summary")
+        if isinstance(rev, str) and rev.strip():
+            st.info(f"🤖 **AI summary** (generated from specs & rating): {rev.strip()}")
     st.markdown("**Specifications**")
     _render_comparison_table([p], category)
     st.markdown("**📊 Why this score?**")

@@ -53,6 +53,7 @@ def load_all() -> None:
         if category == "headphones":
             df = df.rename(columns=_HEADPHONE_COLUMN_MAP)
         df = _attach_images(category, df)
+        df = _attach_enrichment(category, df)
         _dataframes[category] = df
         print(f"  [OK] Loaded {len(df)} {category}")
 
@@ -84,6 +85,51 @@ def _attach_images(category: str, df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["image_url"] = df.apply(_lookup, axis=1)
     return df
+
+
+def _attach_enrichment(category: str, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add enrichment columns from offline side files (no network), if present:
+      - description / review_summary  <- datasets/<category>_enrichment.json
+        (AI-generated from specs by enrich_smartphones.py; the summary must be
+        labeled AI-generated wherever it is shown)
+      - real_review / real_review_url <- datasets/<category>_reviews.json
+        (real GSMArena editorial-review excerpts for the flagship subset, scraped
+        locally by enrich_reviews.py; absent for most phones, which keep the summary)
+    Missing entries / missing files stay null.
+    """
+    import json
+    brand_col = "brand_name" if category == "smartphone" else "brand"
+    if brand_col not in df.columns or "model" not in df.columns:
+        return df
+
+    def _load(name):
+        path = Path(f"datasets/{name}")
+        if not path.exists():
+            return {}
+        try:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    enr = _load(f"{category}_enrichment.json")
+    rev = _load(f"{category}_reviews.json")
+    if not enr and not rev:
+        return df
+
+    def _get(row, cache, field):
+        key = f"{category}|{str(row[brand_col]).strip().lower()}|{str(row['model']).strip().lower()}"
+        entry = cache.get(key)
+        return entry.get(field) if entry else None
+
+    df = df.copy()
+    df["description"] = df.apply(lambda r: _get(r, enr, "description"), axis=1)
+    df["review_summary"] = df.apply(lambda r: _get(r, enr, "review_summary"), axis=1)
+    df["real_review"] = df.apply(lambda r: _get(r, rev, "review_excerpt"), axis=1)
+    df["real_review_url"] = df.apply(lambda r: _get(r, rev, "review_url"), axis=1)
+    return df
+
 
 def get_categories() -> List[str]:
     return list(_dataframes.keys())
