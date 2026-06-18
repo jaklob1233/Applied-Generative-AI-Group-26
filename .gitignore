@@ -7,5 +7,13 @@
 # Environment files
 .env
 
+# Local agent / editor tooling (Claude Code, preview config, local settings)
+.claude/
+
 # Python cache
 __pycache__/
+
+# Runtime data (auto-created)
+logs/
+profiles/
+models/

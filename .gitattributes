@@ -1,0 +1,7 @@
+# Treat these as binary so Git never applies line-ending conversion (which would
+# corrupt them). Text files keep normal autocrlf handling.
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
